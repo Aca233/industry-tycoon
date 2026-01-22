@@ -37,7 +37,7 @@
 start.bat
 ```
 
-这将自动安装依赖、启动服务器和客户端，并打开浏览器。
+这将自动安装依赖、构建共享包、启动服务器和客户端，并打开浏览器。
 
 ### 手动安装
 
@@ -46,12 +46,18 @@ start.bat
 git clone https://github.com/YOUR_USERNAME/industry-tycoon.git
 cd industry-tycoon
 
-# 安装依赖
+# 安装依赖（会自动构建 shared 和 game-core 包）
 pnpm install
 
 # 启动开发服务器
 pnpm dev
 ```
+
+> **注意**: `pnpm install` 会自动运行 `postinstall` 脚本来构建依赖包。如果遇到问题，可以手动执行：
+> ```bash
+> pnpm --filter @scc/shared build
+> pnpm --filter @scc/game-core build
+> ```
 
 访问 http://localhost:5173 开始游戏！
 

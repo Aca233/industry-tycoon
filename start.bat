@@ -1,60 +1,83 @@
 @echo off
 chcp 65001 >nul
-title Industry Tycoon - 一键启动
+title Industry Tycoon
 
 echo ========================================
-echo   Industry Tycoon - 工业大亨
+echo   Industry Tycoon
 echo   Victoria 3 Style Business Simulation
 echo ========================================
 echo.
 
-:: 检查 pnpm
+:: Check pnpm
 where pnpm >nul 2>&1
 if errorlevel 1 (
-    echo [错误] 未找到 pnpm，请先安装 pnpm
-    echo 运行: npm install -g pnpm
+    echo [ERROR] pnpm not found, please install pnpm first
+    echo Run: npm install -g pnpm
     pause
     exit /b 1
 )
 
-:: 检查 node_modules
+:: Check node_modules
 if not exist "node_modules" (
-    echo [信息] 首次运行，正在安装依赖...
+    echo [INFO] First run, installing dependencies...
     call pnpm install
     if errorlevel 1 (
-        echo [错误] 依赖安装失败
+        echo [ERROR] Failed to install dependencies
         pause
         exit /b 1
     )
 )
 
-echo [启动] 正在启动服务器和客户端...
+:: Check if shared package is built
+if not exist "packages\shared\dist" (
+    echo [INFO] Building shared package...
+    call pnpm --filter @scc/shared build
+    if errorlevel 1 (
+        echo [ERROR] Failed to build shared package
+        pause
+        exit /b 1
+    )
+)
+
+:: Check if game-core package is built
+if not exist "packages\game-core\dist" (
+    echo [INFO] Building game-core package...
+    call pnpm --filter @scc/game-core build
+    if errorlevel 1 (
+        echo [ERROR] Failed to build game-core package
+        pause
+        exit /b 1
+    )
+)
+
+echo [START] Starting server and client...
 echo.
-echo   服务器: http://localhost:3002
-echo   客户端: http://localhost:5173
+echo   Server: http://localhost:3002
+echo   Client: http://localhost:5173
 echo.
-echo   按 Ctrl+C 停止所有服务
+echo   Press Ctrl+C to stop all services
 echo ========================================
 echo.
 
-:: 启动服务器和客户端
+:: Start server and client in new windows
 start "SCC Server" cmd /c "cd packages\server && pnpm dev"
 timeout /t 2 >nul
 start "SCC Client" cmd /c "cd packages\client && pnpm dev"
 
-:: 等待客户端启动后自动打开浏览器
-echo [信息] 等待服务启动...
+:: Wait for client to start then open browser
+echo [INFO] Waiting for services to start...
 timeout /t 3 >nul
-echo [信息] 正在打开浏览器...
+echo [INFO] Opening browser...
 start http://localhost:5173
 
 echo.
-echo [信息] 服务已启动完毕！
+echo [INFO] Services started!
 echo.
-echo   - 服务器窗口: SCC Server
-echo   - 客户端窗口: SCC Client
-echo   - 浏览器: http://localhost:5173
+echo   - Server window: SCC Server
+echo   - Client window: SCC Client
+echo   - Browser: http://localhost:5173
 echo.
-echo 关闭此窗口不会停止服务，需要手动关闭服务器和客户端窗口
+echo Close this window will NOT stop services.
+echo You need to close server and client windows manually.
 echo.
 pause

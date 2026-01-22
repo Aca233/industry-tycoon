@@ -10,6 +10,7 @@
   },
   "packageManager": "pnpm@9.15.0",
   "scripts": {
+    "postinstall": "pnpm --filter @scc/shared build && pnpm --filter @scc/game-core build",
     "dev": "pnpm -r --parallel run dev",
     "dev:client": "pnpm --filter @scc/client dev",
     "dev:server": "pnpm --filter @scc/server dev",
