@@ -1,0 +1,9 @@
+node_modules
+dist
+build
+coverage
+.next
+.turbo
+*.min.js
+*.min.css
+pnpm-lock.yaml

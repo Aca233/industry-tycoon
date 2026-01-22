@@ -1,0 +1,37 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022"],
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "resolveJsonModule": true,
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true,
+    "composite": true,
+    "incremental": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noImplicitReturns": true,
+    "noFallthroughCasesInSwitch": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "baseUrl": ".",
+    "paths": {
+      "@scc/shared": ["packages/shared/src"],
+      "@scc/shared/*": ["packages/shared/src/*"],
+      "@scc/game-core": ["packages/game-core/src"],
+      "@scc/game-core/*": ["packages/game-core/src/*"]
+    }
+  },
+  "references": [
+    { "path": "packages/shared" },
+    { "path": "packages/game-core" },
+    { "path": "packages/server" }
+  ],
+  "exclude": ["node_modules", "dist", "**/dist"]
+}

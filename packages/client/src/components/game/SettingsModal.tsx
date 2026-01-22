@@ -1,0 +1,347 @@
+/**
+ * Settings Modal - LLM API Configuration
+ * 游戏内设置弹窗，用于配置LLM API
+ */
+
+import { useState, useEffect } from 'react';
+import { api } from '../../api/client.js';
+
+interface SettingsModalProps {
+  onClose: () => void;
+}
+
+export function SettingsModal({ onClose }: SettingsModalProps) {
+  const [apiKey, setApiKey] = useState('');
+  const [baseUrl, setBaseUrl] = useState('');
+  const [model, setModel] = useState('');
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [testing, setTesting] = useState(false);
+  const [loadingModels, setLoadingModels] = useState(false);
+  const [availableModels, setAvailableModels] = useState<string[]>([]);
+  const [testResult, setTestResult] = useState<{ success: boolean; message: string } | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  // Load current config on mount
+  useEffect(() => {
+    loadConfig();
+  }, []);
+
+  const loadConfig = async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const result = await api.getLLMConfig();
+      if (result.error) {
+        setError(result.error);
+      } else {
+        setApiKey(result.data.apiKey || '');
+        setBaseUrl(result.data.baseUrl || '');
+        setModel(result.data.model || '');
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '加载配置失败');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleSave = async () => {
+    setSaving(true);
+    setError(null);
+    setTestResult(null);
+    try {
+      const config: { apiKey?: string; baseUrl?: string; model?: string } = {};
+      
+      // Only send non-empty values, and only send apiKey if it's not masked
+      if (apiKey && !apiKey.includes('****')) {
+        config.apiKey = apiKey;
+      }
+      if (baseUrl) {
+        config.baseUrl = baseUrl;
+      }
+      if (model) {
+        config.model = model;
+      }
+      
+      const result = await api.updateLLMConfig(config);
+      if (result.error) {
+        setError(result.error);
+      } else {
+        setTestResult({ success: true, message: '配置已保存！' });
+        // Update local state with returned config
+        setApiKey(result.data.config.apiKey || '');
+        setBaseUrl(result.data.config.baseUrl || '');
+        setModel(result.data.config.model || '');
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '保存配置失败');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  // 构建临时配置（用于测试和获取模型，不保存）
+  const buildTempConfig = () => {
+    const config: { apiKey?: string; baseUrl?: string; model?: string } = {};
+    // 如果apiKey不是掩码格式，则使用当前输入的值
+    if (apiKey && !apiKey.includes('****')) {
+      config.apiKey = apiKey;
+    }
+    if (baseUrl) {
+      config.baseUrl = baseUrl;
+    }
+    if (model) {
+      config.model = model;
+    }
+    return config;
+  };
+
+  const handleTest = async () => {
+    setTesting(true);
+    setError(null);
+    setTestResult(null);
+    
+    // 客户端超时控制
+    const timeoutId = setTimeout(() => {
+      setTesting(false);
+      setTestResult({ success: false, message: '请求超时，请检查网络连接或API配置' });
+    }, 20000); // 20秒超时
+    
+    try {
+      // 使用临时配置测试（不保存）
+      const tempConfig = buildTempConfig();
+      const result = await api.testLLMConnectionTemp(tempConfig);
+      clearTimeout(timeoutId);
+      if (result.error) {
+        setTestResult({ success: false, message: result.error });
+      } else {
+        setTestResult(result.data);
+      }
+    } catch (err) {
+      clearTimeout(timeoutId);
+      setTestResult({ success: false, message: err instanceof Error ? err.message : '测试失败' });
+    } finally {
+      setTesting(false);
+    }
+  };
+
+  const handleLoadModels = async () => {
+    setLoadingModels(true);
+    setError(null);
+    
+    // 客户端超时控制
+    const timeoutId = setTimeout(() => {
+      setLoadingModels(false);
+      setError('获取模型列表超时');
+    }, 15000);
+    
+    try {
+      // 使用临时配置获取模型列表（不保存）
+      const tempConfig = buildTempConfig();
+      const result = await api.getAvailableModelsTemp(tempConfig);
+      clearTimeout(timeoutId);
+      if (result.error) {
+        setError(result.error);
+      } else if (result.data.success) {
+        setAvailableModels(result.data.models);
+        if (result.data.models.length === 0) {
+          setError('未找到可用模型，请检查API配置');
+        }
+      } else {
+        setError(result.data.message || '获取模型列表失败');
+      }
+    } catch (err) {
+      clearTimeout(timeoutId);
+      setError(err instanceof Error ? err.message : '获取模型列表失败');
+    } finally {
+      setLoadingModels(false);
+    }
+  };
+
+  const handleBackdropClick = (e: React.MouseEvent) => {
+    if (e.target === e.currentTarget) {
+      onClose();
+    }
+  };
+
+  return (
+    <div 
+      className="fixed inset-0 bg-black/70 z-50 flex items-center justify-center p-4"
+      onClick={handleBackdropClick}
+    >
+      <div className="bg-slate-800 rounded-xl max-w-lg w-full shadow-2xl border border-slate-700">
+        {/* Header */}
+        <div className="flex items-center justify-between p-4 border-b border-slate-700">
+          <h2 className="text-xl font-bold text-white flex items-center gap-2">
+            <span>⚙️</span>
+            <span>LLM API 设置</span>
+          </h2>
+          <button
+            onClick={onClose}
+            className="text-gray-400 hover:text-white transition-colors"
+          >
+            ✕
+          </button>
+        </div>
+
+        {/* Content */}
+        <div className="p-4 space-y-4">
+          {loading ? (
+            <div className="text-center py-8">
+              <div className="animate-spin w-8 h-8 border-2 border-cyan-500 border-t-transparent rounded-full mx-auto mb-2"></div>
+              <p className="text-gray-400">加载配置中...</p>
+            </div>
+          ) : (
+            <>
+              {/* API Key */}
+              <div>
+                <label className="block text-sm font-medium text-gray-300 mb-1">
+                  API Key
+                </label>
+                <input
+                  type="password"
+                  value={apiKey}
+                  onChange={(e) => setApiKey(e.target.value)}
+                  placeholder="sk-..."
+                  className="w-full px-3 py-2 bg-slate-700 border border-slate-600 rounded-lg text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-cyan-500 focus:border-transparent"
+                />
+                <p className="text-xs text-gray-500 mt-1">
+                  输入新的API Key将覆盖现有配置。留空则保持不变。
+                </p>
+              </div>
+
+              {/* Base URL */}
+              <div>
+                <label className="block text-sm font-medium text-gray-300 mb-1">
+                  API Base URL
+                </label>
+                <input
+                  type="text"
+                  value={baseUrl}
+                  onChange={(e) => setBaseUrl(e.target.value)}
+                  placeholder="https://api.openai.com/v1"
+                  className="w-full px-3 py-2 bg-slate-700 border border-slate-600 rounded-lg text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-cyan-500 focus:border-transparent"
+                />
+                <p className="text-xs text-gray-500 mt-1">
+                  支持OpenAI官方API或兼容的第三方API（如中转站）
+                </p>
+              </div>
+
+              {/* Model */}
+              <div>
+                <label className="block text-sm font-medium text-gray-300 mb-1">
+                  模型名称
+                </label>
+                <div className="flex gap-2">
+                  {availableModels.length > 0 ? (
+                    <select
+                      value={model}
+                      onChange={(e) => setModel(e.target.value)}
+                      className="flex-1 px-3 py-2 bg-slate-700 border border-slate-600 rounded-lg text-white focus:outline-none focus:ring-2 focus:ring-cyan-500 focus:border-transparent"
+                    >
+                      <option value="">选择模型...</option>
+                      {availableModels.map((m) => (
+                        <option key={m} value={m}>{m}</option>
+                      ))}
+                    </select>
+                  ) : (
+                    <input
+                      type="text"
+                      value={model}
+                      onChange={(e) => setModel(e.target.value)}
+                      placeholder="gpt-4o-mini"
+                      className="flex-1 px-3 py-2 bg-slate-700 border border-slate-600 rounded-lg text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-cyan-500 focus:border-transparent"
+                    />
+                  )}
+                  <button
+                    onClick={handleLoadModels}
+                    disabled={loadingModels || (!apiKey || apiKey.includes('****')) && !baseUrl}
+                    className="px-3 py-2 bg-slate-600 text-white rounded-lg hover:bg-slate-500 transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1"
+                    title="使用当前配置获取可用模型列表（无需保存）"
+                  >
+                    {loadingModels ? (
+                      <span className="animate-spin w-4 h-4 border-2 border-white border-t-transparent rounded-full"></span>
+                    ) : (
+                      <span>🔄</span>
+                    )}
+                  </button>
+                </div>
+                <p className="text-xs text-gray-500 mt-1">
+                  {availableModels.length > 0
+                    ? `已加载 ${availableModels.length} 个模型`
+                    : '输入API Key后点击🔄获取模型列表（无需先保存）'}
+                </p>
+              </div>
+
+              {/* Error message */}
+              {error && (
+                <div className="p-3 bg-red-900/30 border border-red-700/50 rounded-lg text-red-400 text-sm">
+                  ❌ {error}
+                </div>
+              )}
+
+              {/* Test result */}
+              {testResult && (
+                <div className={`p-3 rounded-lg text-sm ${
+                  testResult.success 
+                    ? 'bg-green-900/30 border border-green-700/50 text-green-400' 
+                    : 'bg-red-900/30 border border-red-700/50 text-red-400'
+                }`}>
+                  {testResult.success ? '✅' : '❌'} {testResult.message}
+                </div>
+              )}
+            </>
+          )}
+        </div>
+
+        {/* Footer */}
+        <div className="flex items-center justify-between p-4 border-t border-slate-700">
+          <button
+            onClick={handleTest}
+            disabled={loading || testing}
+            className="px-4 py-2 bg-slate-700 text-white rounded-lg hover:bg-slate-600 transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2"
+          >
+            {testing ? (
+              <>
+                <span className="animate-spin w-4 h-4 border-2 border-white border-t-transparent rounded-full"></span>
+                <span>测试中...</span>
+              </>
+            ) : (
+              <>
+                <span>🔌</span>
+                <span>测试连接</span>
+              </>
+            )}
+          </button>
+          
+          <div className="flex gap-2">
+            <button
+              onClick={onClose}
+              className="px-4 py-2 bg-slate-700 text-white rounded-lg hover:bg-slate-600 transition-colors"
+            >
+              取消
+            </button>
+            <button
+              onClick={handleSave}
+              disabled={loading || saving}
+              className="px-4 py-2 bg-cyan-600 text-white rounded-lg hover:bg-cyan-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2"
+            >
+              {saving ? (
+                <>
+                  <span className="animate-spin w-4 h-4 border-2 border-white border-t-transparent rounded-full"></span>
+                  <span>保存中...</span>
+                </>
+              ) : (
+                <>
+                  <span>💾</span>
+                  <span>保存配置</span>
+                </>
+              )}
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}

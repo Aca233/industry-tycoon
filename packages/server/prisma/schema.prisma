@@ -1,0 +1,312 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ========== Game State ==========
+
+model Game {
+  id          String   @id @default(cuid())
+  name        String
+  state       Json     // Full game state snapshot
+  currentTick Int      @default(0)
+  speed       Int      @default(1)
+  isPaused    Boolean  @default(true)
+  
+  // Relations
+  companies   Company[]
+  buildings   Building[]
+  contracts   Contract[]
+  events      GameEvent[]
+  
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  
+  @@map("games")
+}
+
+// ========== Company ==========
+
+model Company {
+  id            String   @id @default(cuid())
+  gameId        String
+  game          Game     @relation(fields: [gameId], references: [id], onDelete: Cascade)
+  
+  name          String
+  type          String   // 'player', 'ai_competitor', 'npc'
+  personality   String?  // AI personality type
+  aiPrompt      String?  @db.Text // LLM system prompt
+  
+  // Financials
+  cash          BigInt   @default(500000000) // in cents
+  debt          BigInt   @default(0)
+  creditRating  String   @default("A")
+  stockPrice    BigInt   @default(10000)
+  sharesOut     Int      @default(1000000)
+  
+  // Reputation
+  publicRep     Int      @default(75)
+  supplierRep   Int      @default(80)
+  employeeRep   Int      @default(70)
+  
+  // Relations
+  buildings     Building[]
+  employees     Employee[]
+  sentContracts Contract[] @relation("SellerContracts")
+  receivedContracts Contract[] @relation("BuyerContracts")
+  interactions  Interaction[]
+  
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+  bankruptAt    DateTime?
+  
+  @@index([gameId])
+  @@map("companies")
+}
+
+model Interaction {
+  id            String   @id @default(cuid())
+  companyId     String
+  company       Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  
+  tick          Int
+  type          String   // contract_signed, price_war, etc.
+  targetId      String?
+  description   String
+  outcome       String   // positive, negative, neutral
+  trustImpact   Int      @default(0)
+  
+  createdAt     DateTime @default(now())
+  
+  @@index([companyId])
+  @@map("interactions")
+}
+
+// ========== Buildings ==========
+
+model Building {
+  id             String   @id @default(cuid())
+  gameId         String
+  game           Game     @relation(fields: [gameId], references: [id], onDelete: Cascade)
+  companyId      String
+  company        Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  
+  name           String
+  type           String   // factory, warehouse, power_plant, etc.
+  definitionId   String   // Reference to static definition
+  
+  // Location
+  zoneId         String
+  positionX      Float
+  positionY      Float
+  
+  // Production state
+  activeMethodIds Json    // { process: 'method-id', automation: 'method-id' }
+  efficiency      Float   @default(1.0)
+  condition       Float   @default(1.0)
+  utilization     Float   @default(0.0)
+  
+  // Inventory
+  inputInventory  Json    @default("{}")
+  outputInventory Json    @default("{}")
+  
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  
+  @@index([gameId])
+  @@index([companyId])
+  @@map("buildings")
+}
+
+// ========== Employees ==========
+
+model Employee {
+  id          String   @id @default(cuid())
+  companyId   String
+  company     Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  
+  name        String
+  role        String   // ceo, chief_engineer, worker, etc.
+  skills      Json     // { production: 80, research: 60 }
+  experience  Int      @default(0)
+  
+  salary      BigInt   // in cents
+  satisfaction Int     @default(75)
+  loyalty     Int      @default(75)
+  
+  prevCompanies String[] @default([])
+  hiredAt     DateTime @default(now())
+  
+  @@index([companyId])
+  @@map("employees")
+}
+
+// ========== Contracts ==========
+
+model Contract {
+  id          String   @id @default(cuid())
+  gameId      String
+  
+  sellerId    String
+  seller      Company  @relation("SellerContracts", fields: [sellerId], references: [id])
+  buyerId     String
+  buyer       Company  @relation("BuyerContracts", fields: [buyerId], references: [id])
+  
+  goodsId     String
+  quantity    Int
+  pricePerUnit BigInt  // in cents
+  
+  type        String   // spot, long_term
+  status      String   // pending, active, completed, breached
+  
+  startTick   Int
+  endTick     Int?
+  deliveryFreq Int     @default(1) // ticks between deliveries
+  
+  termsText   String?  @db.Text // LLM-generated contract text
+  
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  
+  @@index([sellerId])
+  @@index([buyerId])
+  @@map("contracts")
+}
+
+// ========== Market ==========
+
+model MarketHistory {
+  id          String   @id @default(cuid())
+  gameId      String
+  goodsId     String
+  tick        Int
+  
+  price       BigInt   // in cents
+  volume      BigInt
+  supply      BigInt
+  demand      BigInt
+  
+  createdAt   DateTime @default(now())
+  
+  @@unique([gameId, goodsId, tick])
+  @@index([gameId, goodsId])
+  @@map("market_history")
+}
+
+// ========== Events ==========
+
+model GameEvent {
+  id          String   @id @default(cuid())
+  gameId      String
+  game        Game     @relation(fields: [gameId], references: [id], onDelete: Cascade)
+  
+  tick        Int
+  type        String   // market_shift, policy_change, disaster, etc.
+  severity    String   // minor, moderate, major, critical
+  
+  title       String
+  description String   @db.Text
+  effects     Json     // { priceChanges: {...}, tagChanges: {...} }
+  
+  isResolved  Boolean  @default(false)
+  resolvedAt  Int?     // tick when resolved
+  
+  createdAt   DateTime @default(now())
+  
+  @@index([gameId])
+  @@map("game_events")
+}
+
+// ========== Research ==========
+
+model Technology {
+  id          String   @id @default(cuid())
+  gameId      String
+  
+  name        String
+  description String   @db.Text
+  inventorId  String   // Company that invented it
+  
+  // Effects
+  effects     Json     // New production methods, tags, etc.
+  sideEffects Json?    // Hidden consequences
+  
+  // Patent
+  patentExpires Int?   // tick when patent expires
+  licenseFee    BigInt? // per-use fee
+  
+  researchCost  BigInt
+  researchTicks Int
+  
+  inventedAt  DateTime @default(now())
+  
+  @@index([gameId])
+  @@map("technologies")
+}
+
+model ResearchProject {
+  id          String   @id @default(cuid())
+  gameId      String
+  companyId   String
+  
+  prompt      String   @db.Text // Player's invention request
+  status      String   // pending, researching, completed, failed
+  
+  progress    Int      @default(0)
+  totalTicks  Int
+  budget      BigInt
+  
+  // LLM evaluation results
+  evaluation  Json?    // { feasibility, risks, projectedCost }
+  resultId    String?  // Reference to created Technology
+  
+  startedAt   DateTime @default(now())
+  completedAt DateTime?
+  
+  @@index([gameId])
+  @@index([companyId])
+  @@map("research_projects")
+}
+
+// ========== Chat/LLM ==========
+
+model ChatSession {
+  id          String   @id @default(cuid())
+  gameId      String
+  companyId   String   // Player or AI company
+  
+  type        String   // assistant, negotiation, lobby
+  targetId    String?  // For negotiations, the other party
+  
+  messages    ChatMessage[]
+  
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  
+  @@index([gameId])
+  @@map("chat_sessions")
+}
+
+model ChatMessage {
+  id          String   @id @default(cuid())
+  sessionId   String
+  session     ChatSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  
+  role        String   // user, assistant, system
+  content     String   @db.Text
+  
+  // For negotiations
+  proposalData Json?   // Structured contract proposal
+  
+  createdAt   DateTime @default(now())
+  
+  @@index([sessionId])
+  @@map("chat_messages")
+}

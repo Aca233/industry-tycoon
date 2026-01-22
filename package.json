@@ -1,0 +1,49 @@
+{
+  "name": "industry-tycoon",
+  "version": "0.1.0",
+  "description": "Industry Tycoon - A Victoria 3 inspired business simulation game with LLM-driven dynamic markets",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20.0.0",
+    "pnpm": ">=9.0.0"
+  },
+  "packageManager": "pnpm@9.15.0",
+  "scripts": {
+    "dev": "pnpm -r --parallel run dev",
+    "dev:client": "pnpm --filter @scc/client dev",
+    "dev:server": "pnpm --filter @scc/server dev",
+    "build": "pnpm -r run build",
+    "build:client": "pnpm --filter @scc/client build",
+    "build:server": "pnpm --filter @scc/server build",
+    "test": "pnpm -r run test",
+    "lint": "pnpm -r run lint",
+    "lint:fix": "pnpm -r run lint:fix",
+    "format": "prettier --write \"**/*.{ts,tsx,js,jsx,json,md}\"",
+    "format:check": "prettier --check \"**/*.{ts,tsx,js,jsx,json,md}\"",
+    "typecheck": "pnpm -r run typecheck",
+    "clean": "pnpm -r run clean && rimraf node_modules",
+    "db:generate": "pnpm --filter @scc/server prisma:generate",
+    "db:push": "pnpm --filter @scc/server prisma:push",
+    "db:migrate": "pnpm --filter @scc/server prisma:migrate",
+    "db:studio": "pnpm --filter @scc/server prisma:studio",
+    "prepare": "husky"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "husky": "^9.1.7",
+    "lint-staged": "^15.2.11",
+    "prettier": "^3.4.2",
+    "rimraf": "^6.0.1",
+    "typescript": "^5.7.2"
+  },
+  "lint-staged": {
+    "*.{ts,tsx,js,jsx}": [
+      "eslint --fix",
+      "prettier --write"
+    ],
+    "*.{json,md,yml,yaml}": [
+      "prettier --write"
+    ]
+  }
+}
