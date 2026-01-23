@@ -5,6 +5,7 @@
 
 import { useState } from 'react';
 import { useGameStore, type AICompanyClient, type CompetitionEventClient } from '../../stores';
+import { formatGameTime } from '../../utils/formatters';
 
 /** 人格类型中文映射 */
 const personalityLabels: Record<string, { label: string; desc: string }> = {
@@ -125,15 +126,9 @@ function CompetitorRow({ company, isExpanded, onToggle }: {
   );
 }
 
-/** 格式化游戏时间 */
-function formatGameTime(tick: number): string {
-  // 假设 720 tick = 1个月
-  const TICKS_PER_MONTH = 720;
-  const months = Math.floor(tick / TICKS_PER_MONTH);
-  const year = Math.floor(months / 12) + 2026;
-  const month = (months % 12) + 1;
-  const day = Math.floor((tick % TICKS_PER_MONTH) / 24) + 1;
-  return `${year}年${month}月${day}日`;
+/** 格式化竞争事件时间 - 使用共享格式化函数 */
+function formatEventTime(tick: number): string {
+  return formatGameTime(tick, 'full');
 }
 
 /** 历史消息面板 - 只显示LLM战略决策 */
@@ -195,7 +190,7 @@ function HistoryPanel({
                     <div className="text-xs text-gray-400 mt-1">{event.description}</div>
                   </div>
                   <div className="text-xs text-gray-500 whitespace-nowrap">
-                    {formatGameTime(event.tick)}
+                    {formatEventTime(event.tick)}
                   </div>
                 </div>
                 {/* 显示LLM生成的战略理由 */}
@@ -307,7 +302,7 @@ export function CompetitorPanel() {
                 <div className="flex items-start justify-between gap-2">
                   <div className="font-medium flex-1">{event.title}</div>
                   <div className="text-gray-500 text-[10px] whitespace-nowrap">
-                    {formatGameTime(event.tick)}
+                    {formatEventTime(event.tick)}
                   </div>
                 </div>
                 <div className="text-gray-500 mt-0.5">{event.description}</div>

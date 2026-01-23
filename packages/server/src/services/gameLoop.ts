@@ -34,6 +34,10 @@ import { economyManager } from './economyManager.js';
 import { inventoryManager } from './inventoryManager.js';
 import { autoTradeManager } from './autoTradeManager.js';
 import { marketOrderBook } from './marketOrderBook.js';
+import { stockMarketService } from './stockMarket.js';
+import { aiStockTradingService } from './aiStockTrading.js';
+import { tickSchedulerFactory, TICK_FREQUENCY } from './tickScheduler.js';
+import { getPriceWorkerPool } from '../workers/index.js';
 
 // 创建商品价格查询表
 const GOODS_BASE_PRICES = new Map(GOODS_DATA.map(g => [g.id, g.basePrice]));
@@ -62,6 +66,8 @@ export interface BuildingInstance {
   productionProgress: number;
   /** 当前使用的生产方式 ID */
   currentMethodId: string;
+  /** 聚合数量：代表多少个相同类型的工厂，默认为1 */
+  aggregatedCount?: number;
 }
 
 /** 价格历史记录（扩展版：包含OHLC和成交量） */
@@ -171,8 +177,12 @@ export interface TickUpdate {
     price: number;
     change: number;
   }> | undefined;
-  /** 当前所有商品价格快照 */
+  /** 当前所有商品价格快照（首次或完整同步时发送） */
   marketPrices?: Record<string, number>;
+  /** 价格增量（只包含发生变化的价格，用于优化带宽） */
+  priceDelta?: Record<string, number>;
+  /** 是否为完整快照（false时客户端应使用增量合并） */
+  isFullSnapshot?: boolean;
   events?: Array<{
     id: string;
     type: string;
@@ -252,18 +262,34 @@ export class GameLoop extends EventEmitter {
   private intervals: Map<string, NodeJS.Timeout> = new Map();
   
   // Base tick rate: milliseconds per tick at 1x speed
-  private readonly BASE_TICK_MS = 1000;
+  // 200ms = 5 ticks per second at 1x, 20 ticks per second at 4x
+  // This allows 1 game-month (720 ticks) to pass in 36 seconds at 4x speed
+  private readonly BASE_TICK_MS = 200;
+  
+  // 价格历史管理（1 tick = 1小时）
+  private readonly MAX_PRICE_HISTORY_LENGTH = 720; // 保留最近720个tick的历史（30天）
+  private readonly PRICE_HISTORY_CLEANUP_THRESHOLD = 900; // 超过此值才触发清理
+  
+  // ===== 增量更新优化 =====
+  // 缓存上一次发送的价格快照，用于计算增量
+  private lastSentPrices: Map<string, Map<string, number>> = new Map(); // gameId -> (goodsId -> price)
+  // 完整快照发送间隔（每N个tick发送一次完整快照，确保客户端同步）
+  private readonly FULL_SNAPSHOT_INTERVAL = 50;
   
   // 建筑收益历史（用于计算滚动平均）
   private buildingProfitHistory: Map<string, Map<string, BuildingProfitHistory>> = new Map();
   // 滚动平均的窗口大小（保留最近N个生产周期）
   private readonly PROFIT_HISTORY_SIZE = 5;
   
-  // 市场事件生成 - 批量预生成模式
-  private lastMarketEventGenerationTick: Map<string, number> = new Map();
+  // 市场事件生成 - 批量预生成模式（由tickScheduler控制触发频率）
   private marketEventGenerationInterval = 200; // 每200 tick生成一批事件
   private scheduledMarketEvents: Map<string, Array<{ event: MarketEventGenerated; triggerTick: number }>> = new Map();
   private pendingMarketEvents: Map<string, MarketEventGenerated[]> = new Map();
+  
+  // Worker 池统计
+  private workerTaskCount = 0;
+  private workerSuccessCount = 0;
+  private workerFailCount = 0;
   
   // 自动采购订单追踪 - 防止重复提交
   // Key: `${buildingId}-${goodsId}`, Value: orderId
@@ -352,6 +378,10 @@ export class GameLoop extends EventEmitter {
       // 初始化自动交易管理器
       autoTradeManager.initialize(playerCompanyId);
       console.log('[GameLoop] Auto trade manager initialized');
+      
+      // 初始化股票市场
+      stockMarketService.initialize(playerCompanyId, 0);
+      console.log('[GameLoop] Stock market initialized');
     }
     
     return game;
@@ -408,32 +438,63 @@ export class GameLoop extends EventEmitter {
   
   /**
    * Start the game loop for a specific game
+   *
+   * 使用递归 setTimeout 代替 setInterval，解决累积延迟问题：
+   * - setInterval 不等待回调完成就调度下一次执行
+   * - 当 processTick() 耗时超过 tickInterval 时，任务会堆积
+   * - 递归 setTimeout 在每次 tick 完成后动态计算下一次延迟
    */
   private startGameLoop(gameId: string): void {
     const game = this.games.get(gameId);
     if (!game || game.isPaused) return;
     
-    // Clear any existing interval
+    // Clear any existing interval/timeout
     this.stopGameLoop(gameId);
     
-    // Calculate interval based on speed
-    const tickInterval = this.BASE_TICK_MS / game.speed;
-    
-    const interval = setInterval(() => {
+    // 递归调度下一个 tick
+    const scheduleNextTick = () => {
+      const currentGame = this.games.get(gameId);
+      if (!currentGame || currentGame.isPaused) {
+        this.intervals.delete(gameId);
+        return;
+      }
+      
+      // 根据当前速度计算目标间隔
+      const tickInterval = this.BASE_TICK_MS / currentGame.speed;
+      const startTime = Date.now();
+      
+      // 执行 tick
       this.processTick(gameId);
-    }, tickInterval);
+      
+      // 计算实际执行时间
+      const elapsed = Date.now() - startTime;
+      
+      // 动态计算下一次延迟，补偿执行耗时
+      // 如果执行时间超过了目标间隔，最小延迟1ms避免阻塞
+      const nextDelay = Math.max(1, tickInterval - elapsed);
+      
+      // 性能警告：如果 tick 执行时间超过目标间隔的150%，输出警告
+      if (elapsed > tickInterval * 1.5 && elapsed > 100) {
+        console.warn(`[GameLoop] ⚠️ Tick 执行过慢: ${elapsed}ms (目标: ${tickInterval}ms) - 游戏可能变慢`);
+      }
+      
+      // 调度下一个 tick
+      const timeout = setTimeout(scheduleNextTick, nextDelay);
+      this.intervals.set(gameId, timeout);
+    };
     
-    this.intervals.set(gameId, interval);
-    console.log(`[GameLoop] Started game ${gameId} at ${game.speed}x speed`);
+    // 开始第一个 tick
+    scheduleNextTick();
+    console.log(`[GameLoop] Started game ${gameId} at ${game.speed}x speed (dynamic scheduling)`);
   }
   
   /**
    * Stop the game loop for a specific game
    */
   private stopGameLoop(gameId: string): void {
-    const interval = this.intervals.get(gameId);
-    if (interval) {
-      clearInterval(interval);
+    const timeout = this.intervals.get(gameId);
+    if (timeout) {
+      clearTimeout(timeout); // 改用 clearTimeout 配合递归 setTimeout
       this.intervals.delete(gameId);
       console.log(`[GameLoop] Stopped game ${gameId}`);
     }
@@ -496,6 +557,7 @@ export class GameLoop extends EventEmitter {
       status: 'running',
       productionProgress: 0,
       currentMethodId: defaultMethodId,
+      aggregatedCount: 1, // 玩家建筑默认为1（不聚合）
     };
     
     game.buildings.push(building);
@@ -678,26 +740,28 @@ export class GameLoop extends EventEmitter {
   
   /**
    * Process a single game tick
+   *
+   * 使用分层调度器优化性能：
+   * - 高频操作（每tick）：建筑生产、订单撮合、价格同步
+   * - 中频操作（每5-20 tick）：AI决策、股票、自动交易
+   * - 低频操作（每50-200 tick）：诊断、LLM事件
    */
   private processTick(gameId: string): void {
     const game = this.games.get(gameId);
     if (!game) return;
     
+    const tickStartTime = Date.now();
+    const scheduler = tickSchedulerFactory.getScheduler(gameId);
+    
     // Advance tick
     game.currentTick++;
-    game.lastUpdate = Date.now();
+    game.lastUpdate = tickStartTime;
     
-    // ===== 更新经济系统（NPC交易、订单撮合、价格发现）=====
-    const economyResult = economyManager.update(game.currentTick);
+    // ===== 高频操作：订单撮合和价格发现（每tick）=====
+    const economyResult = this.processHighFrequencyOperations(game, scheduler);
     
-    // 同步经济系统的价格到游戏状态
-    const economyPrices = economyManager.getAllMarketPrices();
-    for (const [goodsId, price] of economyPrices) {
-      game.marketPrices.set(goodsId, price);
-    }
-    
-    // ===== 经济循环诊断日志（每50 tick输出一次）=====
-    if (game.currentTick % 50 === 0) {
+    // ===== 低频操作：诊断日志 =====
+    if (scheduler.shouldExecute(game.currentTick, 'DIAGNOSTIC_LOG')) {
       this.logEconomicDiagnostics(game, economyResult);
     }
     
@@ -707,264 +771,13 @@ export class GameLoop extends EventEmitter {
       game.playerCash = playerInventory.cash;
     }
     
-    // ===== 基于配方的经济计算 =====
-    // 每个建筑的生产周期由 ticksRequired 决定
-    // 每次完成周期时：收入 = 产出 × 价格，成本 = 投入 × 价格
-    // 维护成本每 tick 都产生（按月分摊）
+    // ===== 高频操作：建筑生产（每tick）=====
+    const { totalIncome, totalInputCost, totalMaintenance, buildingProfits } =
+      this.processBuildingProduction(game, scheduler);
     
-    let totalIncome = 0;
-    let totalInputCost = 0;
-    let totalMaintenance = 0;
-    const buildingProfits: BuildingProfit[] = [];
-    
-    const TICKS_PER_MONTH = 720; // 30天 × 24小时
-    
-    // 每100 tick输出玩家建筑状态诊断（帮助调试）
-    if (game.currentTick % 100 === 0 && game.buildings.length > 0) {
-      console.log(`[GameLoop] 玩家建筑诊断 (tick=${game.currentTick}):`);
-      for (const building of game.buildings) {
-        const def = BUILDINGS_DATA.find(b => b.id === building.definitionId);
-        if (!def) continue;
-        const slot = def.productionSlots[0];
-        const method = slot?.methods.find(m => m.id === building.currentMethodId) ?? slot?.methods[0];
-        if (!method) continue;
-        
-        // 检查原料库存
-        const inputStatus: string[] = [];
-        for (const input of method.recipe.inputs) {
-          const available = inventoryManager.getAvailableQuantity(game.playerCompanyId, input.goodsId);
-          const needed = input.amount;
-          const status = available >= needed ? '✓' : `✗(需${needed},有${available.toFixed(1)})`;
-          inputStatus.push(`${input.goodsId}:${status}`);
-        }
-        
-        console.log(`  - ${building.name}: 状态=${building.status}, 进度=${building.productionProgress.toFixed(1)}/${method.recipe.ticksRequired}, 原料=[${inputStatus.join(', ')}]`);
-      }
-    }
-    
-    for (const building of game.buildings) {
-      const def = BUILDINGS_DATA.find(b => b.id === building.definitionId);
-      if (!def) continue;
-      
-      // 获取当前生产方式
-      const slot = def.productionSlots[0];
-      const method = slot?.methods.find(m => m.id === building.currentMethodId)
-                   ?? slot?.methods[0];
-      
-      if (!method) continue;
-      
-      const recipe = method.recipe;
-      
-      // 获取技术效果修饰符
-      const techModifiers = technologyEffectManager.getBuildingModifiers(
-        building.definitionId,
-        def.category
-      );
-      
-      // 维护成本每 tick 都产生
-      // 重要改进：停工建筑（no_input/no_power）只收取50%维护费
-      // 这减轻了玩家在原料短缺时的财务压力
-      let maintenanceMultiplier = 1.0;
-      if (building.status === 'no_input' || building.status === 'no_power') {
-        maintenanceMultiplier = 0.5; // 停工时只收50%维护费
-      } else if (building.status === 'paused') {
-        maintenanceMultiplier = 0.25; // 主动暂停时只收25%维护费
-      }
-      const buildingMaintenance = (def.maintenanceCost / TICKS_PER_MONTH) * techModifiers.costMultiplier * maintenanceMultiplier;
-      totalMaintenance += buildingMaintenance;
-      
-      let buildingIncome = 0;
-      let buildingInputCost = 0;
-      let produced = false;
-      
-      // 只有 running 状态的建筑才进行生产
-      if (building.status === 'running') {
-        // *** 重要修复：在推进生产进度前，先检查原料是否充足 ***
-        // 这样可以确保缺料时立即显示正确状态，而不是等到周期结束
-        let hasAllInputsForProduction = true;
-        const missingInputsCheck: Array<{ goodsId: string; needed: number; available: number }> = [];
-        
-        for (const input of recipe.inputs) {
-          const adjustedAmount = input.amount * techModifiers.inputMultiplier;
-          const available = inventoryManager.getAvailableQuantity(game.playerCompanyId, input.goodsId);
-          if (available < adjustedAmount) {
-            hasAllInputsForProduction = false;
-            missingInputsCheck.push({
-              goodsId: input.goodsId,
-              needed: adjustedAmount,
-              available,
-            });
-          }
-        }
-        
-        // 如果原料不足，立即切换到 no_input 状态，并触发自动采购
-        if (!hasAllInputsForProduction) {
-          building.status = 'no_input';
-          // 触发自动采购
-          this.autoPurchaseMaterials(game, building, missingInputsCheck);
-        } else {
-          // 原料充足，推进生产进度（应用效率修饰符）
-          const effectiveEfficiency = building.efficiency * building.utilization * techModifiers.efficiencyMultiplier;
-          building.productionProgress += effectiveEfficiency;
-          
-          // 检查是否完成了一个生产周期
-          if (building.productionProgress >= recipe.ticksRequired) {
-            building.productionProgress -= recipe.ticksRequired;
-            produced = true;
-            
-            // 再次检查并消耗库存中的原料（双重检查，确保安全）
-            let hasAllInputs = true;
-            for (const input of recipe.inputs) {
-              const adjustedAmount = input.amount * techModifiers.inputMultiplier;
-              const available = inventoryManager.getAvailableQuantity(game.playerCompanyId, input.goodsId);
-              if (available < adjustedAmount) {
-                hasAllInputs = false;
-                break;
-              }
-            }
-            
-            if (hasAllInputs) {
-              // 消耗原料
-              for (const input of recipe.inputs) {
-                const price = this.getPrice(game, input.goodsId);
-                const adjustedAmount = input.amount * techModifiers.inputMultiplier;
-                inventoryManager.consumeGoods(
-                  game.playerCompanyId,
-                  input.goodsId,
-                  adjustedAmount,
-                  game.currentTick,
-                  `production-${building.id}`
-                );
-                buildingInputCost += adjustedAmount * price;
-                // 增加该商品的需求（消耗 = 需求）
-                this.addDemand(game, input.goodsId, adjustedAmount);
-              }
-              
-              // 添加产出到库存
-              for (const output of recipe.outputs) {
-                const price = this.getPrice(game, output.goodsId);
-                const adjustedAmount = output.amount * techModifiers.outputMultiplier;
-                // 计算生产成本（用于库存成本追踪）
-                const productionCost = buildingInputCost / recipe.outputs.length;
-                inventoryManager.addGoods(
-                  game.playerCompanyId,
-                  output.goodsId,
-                  adjustedAmount,
-                  productionCost / adjustedAmount, // 每单位成本
-                  game.currentTick,
-                  `production-${building.id}`
-                );
-                buildingIncome += adjustedAmount * price;
-                // 增加该商品的供给（产出 = 供给）
-                this.addSupply(game, output.goodsId, adjustedAmount);
-              }
-            } else {
-              // 原料不足，标记建筑状态
-              building.status = 'no_input';
-              produced = false;
-            }
-          }
-        }
-      } else if (building.status === 'no_input') {
-        // 尝试恢复：检查原料是否已经充足
-        let hasAllInputs = true;
-        const missingInputs: Array<{ goodsId: string; needed: number; available: number }> = [];
-        
-        for (const input of recipe.inputs) {
-          const adjustedAmount = input.amount * techModifiers.inputMultiplier;
-          const available = inventoryManager.getAvailableQuantity(game.playerCompanyId, input.goodsId);
-          if (available < adjustedAmount) {
-            hasAllInputs = false;
-            missingInputs.push({
-              goodsId: input.goodsId,
-              needed: adjustedAmount,
-              available,
-            });
-          }
-        }
-        
-        if (hasAllInputs) {
-          // 原料已充足，恢复运行状态
-          building.status = 'running';
-        } else {
-          // 自动采购缺少的原料
-          this.autoPurchaseMaterials(game, building, missingInputs);
-        }
-      } else if (building.status === 'paused') {
-        // 暂停状态不做处理
-      }
-      
-      totalIncome += buildingIncome;
-      totalInputCost += buildingInputCost;
-      
-      // 计算当前周期的净利润
-      const currentNet = buildingIncome - buildingInputCost - buildingMaintenance;
-      
-      // 获取或初始化该建筑的收益历史
-      let gameHistory = this.buildingProfitHistory.get(gameId);
-      if (!gameHistory) {
-        gameHistory = new Map();
-        this.buildingProfitHistory.set(gameId, gameHistory);
-      }
-      
-      let history = gameHistory.get(building.id);
-      if (!history) {
-        history = { recentProfits: [], avgNet: 0 };
-        gameHistory.set(building.id, history);
-      }
-      
-      // 更新滚动平均：只在完成生产周期时才记录收益
-      if (produced) {
-        // 计算完整周期的收益（包含生产收入）
-        const cycleTotalNet = buildingIncome - buildingInputCost;
-        // 加上周期内所有tick的维护成本（近似值：维护成本 × 周期长度）
-        const recipe = method.recipe;
-        const cycleMaintenanceCost = buildingMaintenance * recipe.ticksRequired;
-        const fullCycleNet = cycleTotalNet - cycleMaintenanceCost;
-        
-        // 记录完整周期的每tick平均利润
-        const avgPerTick = fullCycleNet / recipe.ticksRequired;
-        history.recentProfits.push(avgPerTick);
-        
-        // 保持历史记录在窗口大小内
-        if (history.recentProfits.length > this.PROFIT_HISTORY_SIZE) {
-          history.recentProfits.shift();
-        }
-        
-        // 重新计算滚动平均
-        if (history.recentProfits.length > 0) {
-          const sum = history.recentProfits.reduce((a, b) => a + b, 0);
-          history.avgNet = sum / history.recentProfits.length;
-        }
-      }
-      
-      // 记录每个建筑的收益明细（显示滚动平均值）
-      buildingProfits.push({
-        buildingId: building.id,
-        name: building.name,
-        income: buildingIncome,
-        inputCost: buildingInputCost,
-        maintenance: buildingMaintenance,
-        net: currentNet,
-        produced,
-        avgNet: history.avgNet,
-      });
-    }
-    
-    // 维护成本从库存现金中扣除
-    if (totalMaintenance > 0) {
-      inventoryManager.deductCash(
-        game.playerCompanyId,
-        totalMaintenance,
-        game.currentTick,
-        'maintenance'
-      );
-    }
-    
-    // 同步玩家现金
-    const updatedInventory = inventoryManager.getInventory(game.playerCompanyId);
-    if (updatedInventory) {
-      game.playerCash = updatedInventory.cash;
+    // ===== 低频操作：建筑状态诊断 =====
+    if (scheduler.shouldExecute(game.currentTick, 'BUILDING_DIAGNOSTIC') && game.buildings.length > 0) {
+      this.logBuildingDiagnostics(game);
     }
     
     const netProfit = totalIncome - totalInputCost - totalMaintenance;
@@ -984,7 +797,6 @@ export class GameLoop extends EventEmitter {
     
     // 基于供需比例更新市场价格
     const marketChanges: TickUpdate['marketChanges'] = [];
-    const MAX_HISTORY_LENGTH = 1440; // 保留最近1440个tick的历史（24小时 = 1天）
     
     // 汇总本 tick 每个商品的成交量（从 economyResult.trades）
     const tickVolumeByGoods = new Map<string, { total: number; buy: number; sell: number }>();
@@ -1088,9 +900,10 @@ export class GameLoop extends EventEmitter {
         sellVolume: vol?.sell ?? 0,
       });
       
-      // 保留最近100个记录
-      if (history.length > MAX_HISTORY_LENGTH) {
-        game.priceHistory.set(goodsId, history.slice(-MAX_HISTORY_LENGTH));
+      // 延迟清理：只有超过阈值才触发，减少 slice 频率
+      // 这避免了每个 tick 对每个商品都执行 slice O(n) 操作
+      if (history.length > this.PRICE_HISTORY_CLEANUP_THRESHOLD) {
+        game.priceHistory.set(goodsId, history.slice(-this.MAX_PRICE_HISTORY_LENGTH));
       }
       
       if (Math.abs(change) > 0) {
@@ -1098,92 +911,139 @@ export class GameLoop extends EventEmitter {
       }
     }
     
-    // ===== 处理基础消费需求（POPs简化版）=====
-    // 模拟城市居民对各类商品的持续消费需求
-    this.processBasicConsumerDemand(game);
+    // ===== 中频操作：消费需求处理 =====
+    if (scheduler.shouldExecute(game.currentTick, 'CONSUMER_DEMAND')) {
+      // 模拟城市居民对各类商品的持续消费需求
+      // 因为频率降低了，所以需要乘以10来保持总需求量
+      this.processBasicConsumerDemand(game, TICK_FREQUENCY.MEDIUM.CONSUMER_DEMAND);
+    }
     
-    // ===== 处理自动交易 =====
-    // 根据配置自动采购和销售商品
-    const autoTradeResult = autoTradeManager.processTick(
-      game.playerCompanyId,
-      game.currentTick,
-      game as unknown as import('@scc/shared').GameState
-    );
-    
-    // 记录自动交易动作
-    for (const action of autoTradeResult.actions) {
-      if (action.success) {
-        console.log(`[AutoTrade] ${action.type === 'buy' ? '采购' : '销售'} ${action.quantity} ${action.goodsId} @ ${action.price.toFixed(2)}`);
+    // ===== 中频操作：自动交易 =====
+    let autoTradeResult = { actions: [] as Array<{ success: boolean; type: string; quantity: number; goodsId: string; price: number }> };
+    if (scheduler.shouldExecute(game.currentTick, 'AUTO_TRADE')) {
+      autoTradeResult = autoTradeManager.processTick(
+        game.playerCompanyId,
+        game.currentTick,
+        game as unknown as import('@scc/shared').GameState
+      );
+      
+      // 记录自动交易动作
+      for (const action of autoTradeResult.actions) {
+        if (action.success) {
+          console.log(`[AutoTrade] ${action.type === 'buy' ? '采购' : '销售'} ${action.quantity} ${action.goodsId} @ ${action.price.toFixed(2)}`);
+        }
       }
     }
     
-    // ===== 处理AI公司 =====
-    const aiContext = {
-      currentTick: game.currentTick,
-      marketPrices: game.marketPrices,
-      supplyDemand: game.supplyDemand,
-      playerBuildings: game.buildings,
-      playerCash: game.playerCash,
-    };
-    
-    const aiResult = aiCompanyManager.processTick(aiContext);
-    
-    // AI建筑的生产也影响供需系统
-    for (const [, aiCompany] of aiCompanyManager.getCompanies()) {
-      for (const building of aiCompany.buildings) {
-        if (building.status !== 'running') continue;
-        
-        const def = BUILDINGS_DATA.find(b => b.id === building.definitionId);
-        if (!def) continue;
-        
-        const slot = def.productionSlots[0];
-        const method = slot?.methods.find(m => m.id === building.currentMethodId) ?? slot?.methods[0];
-        if (!method) continue;
-        
-        // 检查是否完成生产周期
-        if (building.productionProgress >= method.recipe.ticksRequired) {
-          // AI生产也增加供需
-          for (const input of method.recipe.inputs) {
-            this.addDemand(game, input.goodsId, input.amount * 0.5); // AI需求权重稍低
-          }
-          for (const output of method.recipe.outputs) {
-            this.addSupply(game, output.goodsId, output.amount * 0.5); // AI供给权重稍低
+    // ===== 中频操作：AI公司决策 =====
+    let aiResult = { events: [] as CompetitionEvent[], news: [] as Array<{ companyId: string; headline: string }> };
+    if (scheduler.shouldExecute(game.currentTick, 'AI_COMPANY_DECISION')) {
+      const aiContext = {
+        currentTick: game.currentTick,
+        marketPrices: game.marketPrices,
+        supplyDemand: game.supplyDemand,
+        playerBuildings: game.buildings,
+        playerCash: game.playerCash,
+      };
+      
+      aiResult = aiCompanyManager.processTick(aiContext);
+      
+      // AI建筑的生产也影响供需系统
+      for (const [, aiCompany] of aiCompanyManager.getCompanies()) {
+        for (const building of aiCompany.buildings) {
+          if (building.status !== 'running') continue;
+          
+          const def = BUILDINGS_DATA.find(b => b.id === building.definitionId);
+          if (!def) continue;
+          
+          const slot = def.productionSlots[0];
+          const method = slot?.methods.find(m => m.id === building.currentMethodId) ?? slot?.methods[0];
+          if (!method) continue;
+          
+          // 检查是否完成生产周期
+          if (building.productionProgress >= method.recipe.ticksRequired) {
+            // AI生产也增加供需（乘以频率因子保持总量）
+            for (const input of method.recipe.inputs) {
+              this.addDemand(game, input.goodsId, input.amount * 0.5 * TICK_FREQUENCY.MEDIUM.AI_COMPANY_DECISION);
+            }
+            for (const output of method.recipe.outputs) {
+              this.addSupply(game, output.goodsId, output.amount * 0.5 * TICK_FREQUENCY.MEDIUM.AI_COMPANY_DECISION);
+            }
           }
         }
       }
     }
     
-    // ===== 处理研发进度 =====
-    // 每100 tick输出调试信息
-    if (game.currentTick % 100 === 0) {
-      console.log(`[GameLoop] Tick ${game.currentTick}: Processing research...`);
+    // ===== 中频操作：股票市场 =====
+    if (scheduler.shouldExecute(game.currentTick, 'STOCK_MARKET_UPDATE')) {
+      // 收集公司财务数据用于股价计算
+      const companyFinancials = new Map<string, { cash: number; netIncome: number; totalAssets: number }>();
+      
+      // 玩家公司财务
+      const playerInventoryForStock = inventoryManager.getInventory(game.playerCompanyId);
+      if (playerInventoryForStock) {
+        companyFinancials.set(game.playerCompanyId, {
+          cash: playerInventoryForStock.cash,
+          netIncome: netProfit * 720, // 转换为月收益估算
+          totalAssets: playerInventoryForStock.cash, // 简化处理
+        });
+      }
+      
+      // AI公司财务
+      for (const [companyId, aiCompany] of aiCompanyManager.getCompanies()) {
+        companyFinancials.set(companyId, {
+          cash: aiCompany.cash,
+          netIncome: aiCompany.cash * 0.01, // 估算收益
+          totalAssets: aiCompany.cash * 2,
+        });
+      }
+      
+      // 更新股票市场（撮合订单、更新股价）
+      stockMarketService.processTick(game.currentTick, companyFinancials);
     }
-    const completedProjects = researchService.progressResearch(game.currentTick);
+    
+    // ===== 中频操作：AI股票交易 =====
+    if (scheduler.shouldExecute(game.currentTick, 'AI_STOCK_TRADING')) {
+      const aiStockOrders = aiStockTradingService.processTick(game.currentTick);
+      if (aiStockOrders.length > 0 && scheduler.shouldExecute(game.currentTick, 'DIAGNOSTIC_LOG')) {
+        console.log(`[GameLoop] AI股票交易: ${aiStockOrders.length}笔订单提交`);
+      }
+    }
+    
+    // ===== 中频操作：研发进度 =====
+    let completedProjects: string[] = [];
     const newTechnologies: Array<{ id: string; name: string; category: string }> = [];
-    
-    // 处理完成的研发项目（异步，不阻塞tick）
-    if (completedProjects.length > 0) {
-      this.processCompletedResearch(completedProjects, game.currentTick, newTechnologies);
+    if (scheduler.shouldExecute(game.currentTick, 'RESEARCH_PROGRESS')) {
+      completedProjects = researchService.progressResearch(game.currentTick);
+      
+      // 处理完成的研发项目（异步，不阻塞tick）
+      if (completedProjects.length > 0) {
+        this.processCompletedResearch(completedProjects, game.currentTick, newTechnologies);
+      }
     }
     
-    // 检查专利过期
-    researchService.checkPatentExpiry(game.currentTick);
+    // ===== 低频操作：专利过期检查 =====
+    if (scheduler.shouldExecute(game.currentTick, 'PATENT_EXPIRY_CHECK')) {
+      researchService.checkPatentExpiry(game.currentTick);
+    }
     
-    // Generate random events occasionally (1% chance per tick)
+    // Generate random events occasionally
     const events: Array<{ id: string; type: string; message: string }> = [];
     
-    // 处理副作用触发
-    const triggeredSideEffects = researchService.processSideEffects(game.currentTick);
-    for (const effect of triggeredSideEffects) {
-      // 将副作用作为事件添加
-      events.push({
-        id: `side-effect-${effect.sideEffect.id}`,
-        type: 'side_effect',
-        message: `⚠️ ${effect.technologyName}: ${effect.sideEffect.effect.newsHeadline || effect.sideEffect.name}`,
-      });
-      
-      // 根据副作用类型和严重程度影响游戏
-      this.applySideEffectConsequences(game, effect.sideEffect);
+    // ===== 低频操作：副作用处理 =====
+    if (scheduler.shouldExecute(game.currentTick, 'SIDE_EFFECT_PROCESS')) {
+      const triggeredSideEffects = researchService.processSideEffects(game.currentTick);
+      for (const effect of triggeredSideEffects) {
+        // 将副作用作为事件添加
+        events.push({
+          id: `side-effect-${effect.sideEffect.id}`,
+          type: 'side_effect',
+          message: `⚠️ ${effect.technologyName}: ${effect.sideEffect.effect.newsHeadline || effect.sideEffect.name}`,
+        });
+        
+        // 根据副作用类型和严重程度影响游戏
+        this.applySideEffectConsequences(game, effect.sideEffect);
+      }
     }
     
     // 添加AI新闻作为事件
@@ -1195,11 +1055,8 @@ export class GameLoop extends EventEmitter {
       });
     }
     
-    // 处理LLM市场事件批量生成
-    // 初始值为-200，确保游戏开始时立即生成第一批事件
-    const lastGenTick = this.lastMarketEventGenerationTick.get(gameId) ?? -this.marketEventGenerationInterval;
-    if (game.currentTick - lastGenTick >= this.marketEventGenerationInterval) {
-      this.lastMarketEventGenerationTick.set(gameId, game.currentTick);
+    // ===== 低频操作：LLM市场事件生成 =====
+    if (scheduler.shouldExecute(game.currentTick, 'MARKET_EVENT_GENERATION')) {
       this.generateMarketEventsBatch(game);
     }
     
@@ -1229,10 +1086,45 @@ export class GameLoop extends EventEmitter {
       // 市场事件通过 marketEvents 字段单独发送
     }
     
-    // 构建当前价格快照
-    const marketPricesSnapshot: Record<string, number> = {};
-    for (const [goodsId, price] of game.marketPrices) {
-      marketPricesSnapshot[goodsId] = price;
+    // ===== 增量更新优化：只发送变化的价格 =====
+    const lastPrices = this.lastSentPrices.get(gameId) ?? new Map<string, number>();
+    const isFullSnapshotTick = game.currentTick % this.FULL_SNAPSHOT_INTERVAL === 0 || game.currentTick === 1;
+    
+    let marketPricesSnapshot: Record<string, number> | undefined;
+    let priceDelta: Record<string, number> | undefined;
+    
+    if (isFullSnapshotTick) {
+      // 完整快照：发送所有价格
+      marketPricesSnapshot = {};
+      for (const [goodsId, price] of game.marketPrices) {
+        marketPricesSnapshot[goodsId] = price;
+      }
+      // 更新缓存
+      this.lastSentPrices.set(gameId, new Map(game.marketPrices));
+    } else {
+      // 增量更新：只发送变化的价格
+      priceDelta = {};
+      let hasChanges = false;
+      
+      for (const [goodsId, price] of game.marketPrices) {
+        const lastPrice = lastPrices.get(goodsId);
+        // 只有价格确实变化时才包含在增量中
+        if (lastPrice === undefined || lastPrice !== price) {
+          priceDelta[goodsId] = price;
+          hasChanges = true;
+        }
+      }
+      
+      // 如果没有任何变化，不发送增量
+      if (!hasChanges) {
+        priceDelta = undefined;
+      } else {
+        // 更新缓存
+        for (const [goodsId, price] of Object.entries(priceDelta)) {
+          lastPrices.set(goodsId, price);
+        }
+        this.lastSentPrices.set(gameId, lastPrices);
+      }
     }
     
     // 获取AI公司摘要
@@ -1303,6 +1195,7 @@ export class GameLoop extends EventEmitter {
     }
     
     // Emit tick update
+    // 使用条件展开语法避免将 undefined 赋值给可选属性（exactOptionalPropertyTypes）
     const update: TickUpdate = {
       gameId,
       tick: game.currentTick,
@@ -1310,26 +1203,28 @@ export class GameLoop extends EventEmitter {
       playerCash: game.playerCash,
       buildingCount: game.buildings.length,
       financials,
-      marketPrices: marketPricesSnapshot,
-      marketChanges: marketChanges.length > 0 ? marketChanges : undefined,
-      events: events.length > 0 ? events : undefined,
+      isFullSnapshot: isFullSnapshotTick,
+      // 优化：使用增量更新减少数据传输（条件展开避免 undefined）
+      ...(isFullSnapshotTick && marketPricesSnapshot ? { marketPrices: marketPricesSnapshot } : {}),
+      ...(!isFullSnapshotTick && priceDelta ? { priceDelta } : {}),
+      ...(marketChanges.length > 0 ? { marketChanges } : {}),
+      ...(events.length > 0 ? { events } : {}),
       aiCompanies: aiCompaniesSummary,
-      competitionEvents: aiResult.events.length > 0 ? aiResult.events : undefined,
-      aiNews: aiResult.news.length > 0 ? aiResult.news : undefined,
-      marketEvents: pendingEvents.length > 0 ? pendingEvents : undefined,
-      researchUpdates: (completedProjects.length > 0 || newTechnologies.length > 0) ? {
-        completedProjects,
-        newTechnologies,
-      } : undefined,
-      trades: economyResult.trades.length > 0 ? economyResult.trades : undefined,
+      ...(aiResult.events.length > 0 ? { competitionEvents: aiResult.events } : {}),
+      ...(aiResult.news.length > 0 ? { aiNews: aiResult.news } : {}),
+      ...(pendingEvents.length > 0 ? { marketEvents: pendingEvents } : {}),
+      ...((completedProjects.length > 0 || newTechnologies.length > 0) ? {
+        researchUpdates: { completedProjects, newTechnologies }
+      } : {}),
+      ...(economyResult.trades.length > 0 ? { trades: economyResult.trades } : {}),
       economyStats: {
         totalNPCCompanies: economyResult.stats.totalNPCCompanies,
         totalActiveOrders: economyResult.stats.totalActiveOrders,
         totalTradesThisTick: economyResult.stats.totalTradesThisTick,
       },
-      inventory: inventorySnapshot ?? undefined,
-      buildingShortages: buildingShortages.length > 0 ? buildingShortages : undefined,
-      tickVolumes: Object.keys(tickVolumesRecord).length > 0 ? tickVolumesRecord : undefined,
+      ...(inventorySnapshot ? { inventory: inventorySnapshot } : {}),
+      ...(buildingShortages.length > 0 ? { buildingShortages } : {}),
+      ...(Object.keys(tickVolumesRecord).length > 0 ? { tickVolumes: tickVolumesRecord } : {}),
     };
     
     this.emit('tick', update);
@@ -1379,12 +1274,356 @@ export class GameLoop extends EventEmitter {
   }
   
   /**
+   * 高频操作：经济系统更新（每tick执行）
+   * 包括：订单撮合、价格发现、NPC交易
+   *
+   * 支持 Worker 池并行计算：当 Worker 池可用时，将批量价格计算任务
+   * 分发到 Worker 线程执行，释放主线程
+   */
+  private processHighFrequencyOperations(
+    game: GameState,
+    _scheduler: ReturnType<typeof tickSchedulerFactory.getScheduler>
+  ): { trades: TradeRecord[]; stats: { totalNPCCompanies: number; totalActiveOrders: number; totalTradesThisTick: number } } {
+    // 更新经济系统（NPC交易、订单撮合、价格发现）
+    const economyResult = economyManager.update(game.currentTick);
+    
+    // 同步经济系统的价格到游戏状态
+    const economyPrices = economyManager.getAllMarketPrices();
+    for (const [goodsId, price] of economyPrices) {
+      game.marketPrices.set(goodsId, price);
+    }
+    
+    // 尝试使用 Worker 池进行批量价格计算（异步，不阻塞主循环）
+    // 这里我们触发一个异步任务，结果在下一个 tick 生效
+    this.triggerWorkerPriceCalculation(game);
+    
+    return economyResult;
+  }
+  
+  /**
+   * 触发 Worker 池进行批量价格计算
+   * 异步执行，不阻塞主线程
+   */
+  private triggerWorkerPriceCalculation(game: GameState): void {
+    const workerPool = getPriceWorkerPool();
+    if (!workerPool) return;
+    
+    // 每 10 个 tick 执行一次 Worker 计算（避免过于频繁）
+    if (game.currentTick % 10 !== 0) return;
+    
+    // 准备批量计算数据
+    const goods: Array<{
+      goodsId: string;
+      basePrice: number;
+      supply: number;
+      demand: number;
+      lastTradePrice?: number;
+    }> = [];
+    
+    for (const [goodsId, data] of game.supplyDemand) {
+      const basePrice = GOODS_BASE_PRICES.get(goodsId) ?? 1000;
+      goods.push({
+        goodsId,
+        basePrice,
+        supply: data.supply,
+        demand: data.demand,
+        lastTradePrice: data.lastPrice,
+      });
+    }
+    
+    if (goods.length === 0) return;
+    
+    this.workerTaskCount++;
+    
+    // 异步执行，不等待结果
+    workerPool.execute<
+      { goods: typeof goods; options: { elasticity: number; useLastTradePrice: boolean } },
+      Record<string, number>
+    >('BATCH_CALCULATE', {
+      goods,
+      options: { elasticity: 0.1, useLastTradePrice: true },
+    })
+      .then(calculatedPrices => {
+        this.workerSuccessCount++;
+        // 结果可用于验证或调试，但不直接覆盖价格
+        // 因为经济系统已经有自己的价格发现机制
+        if (game.currentTick % 100 === 0) {
+          console.log(`[GameLoop] Worker 计算完成: ${Object.keys(calculatedPrices).length} 个商品价格`);
+        }
+      })
+      .catch(error => {
+        this.workerFailCount++;
+        if (game.currentTick % 100 === 0) {
+          console.warn(`[GameLoop] Worker 计算失败:`, error);
+        }
+      });
+  }
+  
+  /**
+   * 高频操作：建筑生产处理（每tick执行）
+   * 处理玩家所有建筑的生产周期、原料消耗、产品产出
+   */
+  private processBuildingProduction(
+    game: GameState,
+    _scheduler: ReturnType<typeof tickSchedulerFactory.getScheduler>
+  ): { totalIncome: number; totalInputCost: number; totalMaintenance: number; buildingProfits: BuildingProfit[] } {
+    let totalIncome = 0;
+    let totalInputCost = 0;
+    let totalMaintenance = 0;
+    const buildingProfits: BuildingProfit[] = [];
+    
+    const TICKS_PER_MONTH = 720; // 30天 × 24小时
+    
+    for (const building of game.buildings) {
+      const def = BUILDINGS_DATA.find(b => b.id === building.definitionId);
+      if (!def) continue;
+      
+      // 获取当前生产方式
+      const slot = def.productionSlots[0];
+      const method = slot?.methods.find(m => m.id === building.currentMethodId)
+                   ?? slot?.methods[0];
+      
+      if (!method) continue;
+      
+      const recipe = method.recipe;
+      
+      // 获取技术效果修饰符
+      const techModifiers = technologyEffectManager.getBuildingModifiers(
+        building.definitionId,
+        def.category
+      );
+      
+      // 获取聚合因子（默认为1）
+      const aggregatedCount = building.aggregatedCount ?? 1;
+      
+      // 维护成本每 tick 都产生
+      // 重要改进：停工建筑（no_input/no_power）只收取50%维护费
+      // 维护成本 × 聚合因子（代表多个工厂）
+      let maintenanceMultiplier = 1.0;
+      if (building.status === 'no_input' || building.status === 'no_power') {
+        maintenanceMultiplier = 0.5;
+      } else if (building.status === 'paused') {
+        maintenanceMultiplier = 0.25;
+      }
+      const buildingMaintenance = (def.maintenanceCost / TICKS_PER_MONTH) * techModifiers.costMultiplier * maintenanceMultiplier * aggregatedCount;
+      totalMaintenance += buildingMaintenance;
+      
+      let buildingIncome = 0;
+      let buildingInputCost = 0;
+      let produced = false;
+      
+      // 只有 running 状态的建筑才进行生产
+      if (building.status === 'running') {
+        // 检查原料是否充足
+        let hasAllInputsForProduction = true;
+        const missingInputsCheck: Array<{ goodsId: string; needed: number; available: number }> = [];
+        
+        for (const input of recipe.inputs) {
+          // 原料消耗 × 聚合因子
+          const adjustedAmount = input.amount * techModifiers.inputMultiplier * aggregatedCount;
+          const available = inventoryManager.getAvailableQuantity(game.playerCompanyId, input.goodsId);
+          if (available < adjustedAmount) {
+            hasAllInputsForProduction = false;
+            missingInputsCheck.push({
+              goodsId: input.goodsId,
+              needed: adjustedAmount,
+              available,
+            });
+          }
+        }
+        
+        // 如果原料不足，切换到 no_input 状态
+        if (!hasAllInputsForProduction) {
+          building.status = 'no_input';
+          this.autoPurchaseMaterials(game, building, missingInputsCheck);
+        } else {
+          // 原料充足，推进生产进度
+          const effectiveEfficiency = building.efficiency * building.utilization * techModifiers.efficiencyMultiplier;
+          building.productionProgress += effectiveEfficiency;
+          
+          // 检查是否完成了一个生产周期
+          if (building.productionProgress >= recipe.ticksRequired) {
+            building.productionProgress -= recipe.ticksRequired;
+            produced = true;
+            
+            // 再次检查并消耗库存中的原料
+            let hasAllInputs = true;
+            for (const input of recipe.inputs) {
+              const adjustedAmount = input.amount * techModifiers.inputMultiplier;
+              const available = inventoryManager.getAvailableQuantity(game.playerCompanyId, input.goodsId);
+              if (available < adjustedAmount) {
+                hasAllInputs = false;
+                break;
+              }
+            }
+            
+            if (hasAllInputs) {
+              // 消耗原料 × 聚合因子
+              for (const input of recipe.inputs) {
+                const price = this.getPrice(game, input.goodsId);
+                const adjustedAmount = input.amount * techModifiers.inputMultiplier * aggregatedCount;
+                inventoryManager.consumeGoods(
+                  game.playerCompanyId,
+                  input.goodsId,
+                  adjustedAmount,
+                  game.currentTick,
+                  `production-${building.id}`
+                );
+                buildingInputCost += adjustedAmount * price;
+                this.addDemand(game, input.goodsId, adjustedAmount);
+              }
+              
+              // 添加产出到库存 × 聚合因子
+              for (const output of recipe.outputs) {
+                const price = this.getPrice(game, output.goodsId);
+                const adjustedAmount = output.amount * techModifiers.outputMultiplier * aggregatedCount;
+                const productionCost = buildingInputCost / recipe.outputs.length;
+                inventoryManager.addGoods(
+                  game.playerCompanyId,
+                  output.goodsId,
+                  adjustedAmount,
+                  productionCost / adjustedAmount,
+                  game.currentTick,
+                  `production-${building.id}`
+                );
+                buildingIncome += adjustedAmount * price;
+                this.addSupply(game, output.goodsId, adjustedAmount);
+              }
+            } else {
+              building.status = 'no_input';
+              produced = false;
+            }
+          }
+        }
+      } else if (building.status === 'no_input') {
+        // 尝试恢复：检查原料是否已经充足
+        let hasAllInputs = true;
+        const missingInputs: Array<{ goodsId: string; needed: number; available: number }> = [];
+        
+        for (const input of recipe.inputs) {
+          // 原料检查也要 × 聚合因子
+          const adjustedAmount = input.amount * techModifiers.inputMultiplier * aggregatedCount;
+          const available = inventoryManager.getAvailableQuantity(game.playerCompanyId, input.goodsId);
+          if (available < adjustedAmount) {
+            hasAllInputs = false;
+            missingInputs.push({
+              goodsId: input.goodsId,
+              needed: adjustedAmount,
+              available,
+            });
+          }
+        }
+        
+        if (hasAllInputs) {
+          building.status = 'running';
+        } else {
+          this.autoPurchaseMaterials(game, building, missingInputs);
+        }
+      }
+      // paused 状态不做处理
+      
+      totalIncome += buildingIncome;
+      totalInputCost += buildingInputCost;
+      
+      // 计算当前周期的净利润
+      const currentNet = buildingIncome - buildingInputCost - buildingMaintenance;
+      
+      // 获取或初始化该建筑的收益历史
+      let gameHistory = this.buildingProfitHistory.get(game.id);
+      if (!gameHistory) {
+        gameHistory = new Map();
+        this.buildingProfitHistory.set(game.id, gameHistory);
+      }
+      
+      let history = gameHistory.get(building.id);
+      if (!history) {
+        history = { recentProfits: [], avgNet: 0 };
+        gameHistory.set(building.id, history);
+      }
+      
+      // 更新滚动平均：只在完成生产周期时才记录收益
+      if (produced) {
+        const cycleTotalNet = buildingIncome - buildingInputCost;
+        const cycleMaintenanceCost = buildingMaintenance * recipe.ticksRequired;
+        const fullCycleNet = cycleTotalNet - cycleMaintenanceCost;
+        const avgPerTick = fullCycleNet / recipe.ticksRequired;
+        history.recentProfits.push(avgPerTick);
+        
+        if (history.recentProfits.length > this.PROFIT_HISTORY_SIZE) {
+          history.recentProfits.shift();
+        }
+        
+        if (history.recentProfits.length > 0) {
+          const sum = history.recentProfits.reduce((a, b) => a + b, 0);
+          history.avgNet = sum / history.recentProfits.length;
+        }
+      }
+      
+      buildingProfits.push({
+        buildingId: building.id,
+        name: building.name,
+        income: buildingIncome,
+        inputCost: buildingInputCost,
+        maintenance: buildingMaintenance,
+        net: currentNet,
+        produced,
+        avgNet: history.avgNet,
+      });
+    }
+    
+    // 维护成本从库存现金中扣除
+    if (totalMaintenance > 0) {
+      inventoryManager.deductCash(
+        game.playerCompanyId,
+        totalMaintenance,
+        game.currentTick,
+        'maintenance'
+      );
+    }
+    
+    // 同步玩家现金
+    const updatedInventory = inventoryManager.getInventory(game.playerCompanyId);
+    if (updatedInventory) {
+      game.playerCash = updatedInventory.cash;
+    }
+    
+    return { totalIncome, totalInputCost, totalMaintenance, buildingProfits };
+  }
+  
+  /**
+   * 低频操作：建筑状态诊断日志
+   */
+  private logBuildingDiagnostics(game: GameState): void {
+    console.log(`[GameLoop] 玩家建筑诊断 (tick=${game.currentTick}):`);
+    for (const building of game.buildings) {
+      const def = BUILDINGS_DATA.find(b => b.id === building.definitionId);
+      if (!def) continue;
+      const slot = def.productionSlots[0];
+      const method = slot?.methods.find(m => m.id === building.currentMethodId) ?? slot?.methods[0];
+      if (!method) continue;
+      
+      // 检查原料库存
+      const inputStatus: string[] = [];
+      for (const input of method.recipe.inputs) {
+        const available = inventoryManager.getAvailableQuantity(game.playerCompanyId, input.goodsId);
+        const needed = input.amount;
+        const status = available >= needed ? '✓' : `✗(需${needed},有${available.toFixed(1)})`;
+        inputStatus.push(`${input.goodsId}:${status}`);
+      }
+      
+      console.log(`  - ${building.name}: 状态=${building.status}, 进度=${building.productionProgress.toFixed(1)}/${method.recipe.ticksRequired}, 原料=[${inputStatus.join(', ')}]`);
+    }
+  }
+  
+  /**
    * 处理基础消费需求 - 模拟城市POPs的持续消费
    * 使用 GoodsRegistry 自动获取消费需求配置
    *
    * 增加了周期性波动机制，模拟季节性需求变化
+   * @param game 游戏状态
+   * @param frequencyMultiplier 频率倍数（用于补偿中频执行时的需求量）
    */
-  private processBasicConsumerDemand(game: GameState): void {
+  private processBasicConsumerDemand(game: GameState, frequencyMultiplier: number = 1): void {
     // 从注册表获取消费需求映射
     // consumerDemandRate 由 GoodsRegistry 根据商品类别和标签自动派生
     const goodsRegistry = getGoodsRegistry();
@@ -1413,8 +1652,8 @@ export class GameLoop extends EventEmitter {
       // 添加小幅随机噪声 (±10%)
       const noise = 0.9 + Math.random() * 0.2;
       
-      // 最终需求 = 基础需求 × 周期波动 × 随机噪声
-      const demand = baseDemand * cyclicMultiplier * noise;
+      // 最终需求 = 基础需求 × 周期波动 × 随机噪声 × 频率补偿
+      const demand = baseDemand * cyclicMultiplier * noise * frequencyMultiplier;
       this.addDemand(game, goodsId, demand);
       
       // 每个商品相位偏移，使波动交错
@@ -1620,6 +1859,12 @@ export class GameLoop extends EventEmitter {
     // 重置经济系统
     economyManager.reset();
     
+    // 重置股票市场
+    stockMarketService.reset();
+    
+    // 重置AI股票交易服务
+    aiStockTradingService.reset();
+    
     // Create a fresh game
     const newGame = this.getOrCreateGame(gameId, existingGame.playerCompanyId);
     
@@ -1815,6 +2060,15 @@ export class GameLoop extends EventEmitter {
     if (!playerInventory) return;
     
     console.log(`\n========== 经济诊断 (tick=${game.currentTick}) ==========`);
+    
+    // Worker 池状态
+    const workerPool = getPriceWorkerPool();
+    if (workerPool) {
+      const stats = workerPool.getStats();
+      console.log(`🧵 Worker Pool: ${stats.totalWorkers} workers (${stats.busyWorkers} busy), 队列=${stats.queueLength}, 任务统计: 总${this.workerTaskCount}/成功${this.workerSuccessCount}/失败${this.workerFailCount}`);
+    } else {
+      console.log(`🧵 Worker Pool: 未启用（使用主线程计算）`);
+    }
     
     // 1. 玩家财务状态
     console.log(`📊 玩家财务: 现金=$${(playerInventory.cash / 100).toFixed(2)}`);

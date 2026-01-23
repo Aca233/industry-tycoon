@@ -14,6 +14,7 @@ import {
 import { economyManager } from './economyManager.js';
 import { inventoryManager } from './inventoryManager.js';
 import { priceDiscoveryService } from './priceDiscovery.js';
+import { marketOrderBook } from './marketOrderBook.js';
 
 // ============ 类型定义 ============
 
@@ -266,7 +267,7 @@ class AutoTradeManager {
         const method = slot.methods.find((m: ProductionMethodData) => m.id === (activeMethodId || slot.defaultMethodId));
         if (!method) continue;
         
-        const ticksPerDay = 720; // 假设一天720个tick
+        const ticksPerDay = 24; // 统一时间体系：1 tick = 1小时，1天 = 24 ticks
         const cyclesPerDay = ticksPerDay / method.recipe.ticksRequired;
         
         // 计算每日消耗
@@ -518,21 +519,46 @@ class AutoTradeManager {
       return null;
     }
     
-    // 检查是否已有该商品的卖单
-    const hasSellOrder = orders.some(o => o.goodsId === goodsId && o.orderType === 'sell');
-    if (hasSellOrder) {
-      return null;
+    // 检查是否已有该商品的卖单（需验证订单仍在市场中有效）
+    const existingSellOrderIndex = orders.findIndex(o => o.goodsId === goodsId && o.orderType === 'sell');
+    if (existingSellOrderIndex >= 0) {
+      const existingOrder = orders[existingSellOrderIndex]!;
+      // 验证订单是否仍然有效
+      const marketOrder = marketOrderBook.getOrder(existingOrder.orderId);
+      if (marketOrder && (marketOrder.status === 'open' || marketOrder.status === 'partial')) {
+        // 订单仍有效，跳过
+        return null;
+      } else {
+        // 订单已完成或失效，从追踪中移除
+        orders.splice(existingSellOrderIndex, 1);
+        console.log(`[AutoTrade] 清理失效卖单追踪: ${existingOrder.orderId} (${goodsId})`);
+      }
     }
     
     // 计算销售量（超出部分减去保留量）
-    const sellAmount = availableToSell - config.autoSell.reserveStock;
+    // 修复：当库存远超阈值时，增加销售量以加快出货
+    let sellAmount = availableToSell - config.autoSell.reserveStock;
+    
+    // 如果库存超过阈值的10倍，视为积压，加大销售力度
+    if (availableToSell > config.autoSell.triggerThreshold * 10) {
+      // 尝试卖掉80%的可用库存
+      sellAmount = Math.floor(availableToSell * 0.8);
+      console.log(`[AutoTrade] 检测到库存积压 ${goodsId}: ${availableToSell}件, 加大销售量至 ${sellAmount}`);
+    }
+    
     if (sellAmount <= 0) {
       return null;
     }
     
     // 获取市场价格
     const marketPrice = priceDiscoveryService.getPrice(goodsId);
-    const minPrice = marketPrice * config.autoSell.minPriceMultiplier;
+    // 库存积压时，降低价格以促成交易
+    let priceMultiplier = config.autoSell.minPriceMultiplier;
+    if (availableToSell > config.autoSell.triggerThreshold * 20) {
+      // 严重积压，进一步降价
+      priceMultiplier = Math.max(0.7, priceMultiplier - 0.1);
+    }
+    const minPrice = marketPrice * priceMultiplier;
     
     // 提交卖单
     const result = economyManager.playerSubmitSellOrder(
@@ -563,7 +589,9 @@ class AutoTradeManager {
         originalMarketPrice: marketPrice,
       });
       
-      console.log(`[AutoTrade] ${companyId} 自动销售 ${sellAmount} ${goodsId} @ ${minPrice.toFixed(2)}`);
+      console.log(`[AutoTrade] ${companyId} 自动销售 ${sellAmount} ${goodsId} @ ${minPrice.toFixed(2)} (库存: ${currentQuantity})`);
+    } else {
+      console.log(`[AutoTrade] ${companyId} 自动销售失败 ${goodsId}: ${(result as { success: false; error: string }).error || '未知错误'}`);
     }
     
     return action;

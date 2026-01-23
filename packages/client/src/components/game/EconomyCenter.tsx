@@ -1,11 +1,16 @@
 /**
  * EconomyCenter - 经济管理中心（主面板模式）
  * 三栏布局：左侧商品分类树 | 中间商品详情 | 右侧交易操作
+ *
+ * 性能优化：
+ * - React.memo 包装子组件，避免不必要的重渲染
+ * - useMemo 缓存计算结果
+ * - useCallback 缓存事件处理函数
  */
 
-import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
-import * as d3 from 'd3';
-import { useGameStore, useInventory, useMarketPrices, usePriceHistory, useEconomySelectedGoodsId, type InventoryStockItem, type PriceHistoryEntry } from '../../stores';
+import { useState, useEffect, useCallback, useMemo, memo } from 'react';
+import { useGameStore, useInventory, useMarketPrices, usePriceHistory, useEconomySelectedGoodsId, type InventoryStockItem } from '../../stores';
+import { PriceChartWrapperCanvas } from './PriceChartCanvas';
 import { gameWebSocket } from '../../services/websocket';
 import {
   GOODS_DATA,
@@ -112,637 +117,64 @@ const categoryIcons: Record<string, string> = {
   service: '⚡',
 };
 
-// ============ 图表模式类型 ============
-type ChartMode = 'line' | 'candlestick';
-
-// ============ 时间范围选项 ============
-type TimeRange = '30m' | '1h' | '3h' | '6h' | '12h' | '1d';
-const TIME_RANGES: { value: TimeRange; label: string; ticks: number }[] = [
-  { value: '30m', label: '30分', ticks: 30 },     // 30 ticks = 30分钟
-  { value: '1h', label: '1小时', ticks: 60 },     // 60 ticks = 1小时
-  { value: '3h', label: '3小时', ticks: 180 },    // 180 ticks = 3小时
-  { value: '6h', label: '6小时', ticks: 360 },    // 360 ticks = 6小时
-  { value: '12h', label: '12小时', ticks: 720 },  // 720 ticks = 12小时
-  { value: '1d', label: '1天', ticks: 1440 },     // 1440 ticks = 24小时
-];
-
-// ============ 响应式图表包装器 ============
-function PriceChartWrapper({ history }: { history: PriceHistoryEntry[] }) {
-  const containerRef = useRef<HTMLDivElement>(null);
-  const [dimensions, setDimensions] = useState({ width: 600, height: 220 });
-  const [timeRange, setTimeRange] = useState<TimeRange>('6h');
-  
-  useEffect(() => {
-    const updateDimensions = () => {
-      if (containerRef.current) {
-        const rect = containerRef.current.getBoundingClientRect();
-        setDimensions({
-          width: Math.max(300, rect.width - 24), // 减去 padding
-          height: 220,  // 增加高度以容纳时间轴
-        });
-      }
-    };
-    
-    updateDimensions();
-    const resizeObserver = new ResizeObserver(updateDimensions);
-    if (containerRef.current) {
-      resizeObserver.observe(containerRef.current);
-    }
-    
-    return () => resizeObserver.disconnect();
-  }, []);
-  
-  // 根据时间范围筛选数据
-  const filteredHistory = useMemo(() => {
-    const rangeConfig = TIME_RANGES.find(r => r.value === timeRange);
-    if (!rangeConfig || rangeConfig.ticks === Infinity) {
-      return history;
-    }
-    
-    // 取最近 N 个 tick 的数据
-    return history.slice(-rangeConfig.ticks);
-  }, [history, timeRange]);
-  
+// ============ 骨架屏组件（使用 memo 优化） ============
+const Skeleton = memo(function Skeleton({ className = '', animate = true }: { className?: string; animate?: boolean }) {
   return (
-    <div ref={containerRef} className="bg-slate-800/50 rounded-lg p-3">
-      {/* 时间范围选择器 */}
-      <div className="flex items-center justify-between mb-2">
-        <div className="text-[10px] text-gray-500">
-          数据点: {filteredHistory.length} / {history.length}
+    <div
+      className={`bg-slate-700/50 rounded ${animate ? 'animate-pulse' : ''} ${className}`}
+    />
+  );
+});
+
+// ============ 订单簿骨架屏（使用 memo 优化） ============
+const OrderBookSkeleton = memo(function OrderBookSkeleton() {
+  return (
+    <div className="space-y-1">
+      {/* 卖单区域骨架 */}
+      <div className="bg-red-900/15 rounded p-1.5 border border-red-800/20">
+        <div className="flex items-center justify-between text-[10px] text-red-400 mb-1">
+          <span>🔴 卖方报价</span>
+          <Skeleton className="w-8 h-3" />
         </div>
-        <div className="flex gap-1">
-          {TIME_RANGES.map(range => (
-            <button
-              key={range.value}
-              onClick={() => setTimeRange(range.value)}
-              className={`px-2 py-0.5 text-[10px] rounded transition-colors ${
-                timeRange === range.value
-                  ? 'bg-cyan-600 text-white'
-                  : 'bg-slate-700 text-gray-400 hover:bg-slate-600'
-              }`}
-            >
-              {range.label}
-            </button>
+        <div className="space-y-0.5">
+          {[...Array(5)].map((_, i) => (
+            <div key={i} className="grid grid-cols-4 gap-1 px-1 py-0.5">
+              <Skeleton className="h-4" />
+              <Skeleton className="h-4" />
+              <Skeleton className="h-4" />
+              <Skeleton className="h-4" />
+            </div>
           ))}
         </div>
       </div>
-      <PriceChart history={filteredHistory} width={dimensions.width} height={dimensions.height - 30} />
-    </div>
-  );
-}
-
-// ============ 专业价格走势图组件 ============
-function PriceChart({ history, width = 400, height = 200 }: {
-  history: PriceHistoryEntry[];
-  width?: number;
-  height?: number;
-}) {
-  const svgRef = useRef<SVGSVGElement>(null);
-  const [chartMode, setChartMode] = useState<ChartMode>('line');
-  const [showMA, setShowMA] = useState(true);
-  const [showVolume, setShowVolume] = useState(true);
-
-  // 计算移动平均线
-  const calculateMA = (data: number[], period: number): (number | null)[] => {
-    return data.map((_, i) => {
-      if (i < period - 1) return null;
-      const sum = data.slice(i - period + 1, i + 1).reduce((a, b) => a + b, 0);
-      return sum / period;
-    });
-  };
-
-  // 计算布林带
-  const calculateBollinger = (data: number[], period: number = 20, multiplier: number = 2): {
-    upper: (number | null)[];
-    middle: (number | null)[];
-    lower: (number | null)[];
-  } => {
-    const middle = calculateMA(data, period);
-    const upper: (number | null)[] = [];
-    const lower: (number | null)[] = [];
-    
-    data.forEach((_, i) => {
-      if (i < period - 1 || middle[i] === null) {
-        upper.push(null);
-        lower.push(null);
-        return;
-      }
-      const slice = data.slice(i - period + 1, i + 1);
-      const mean = middle[i]!;
-      const variance = slice.reduce((sum, val) => sum + Math.pow(val - mean, 2), 0) / period;
-      const stdDev = Math.sqrt(variance);
-      upper.push(mean + multiplier * stdDev);
-      lower.push(mean - multiplier * stdDev);
-    });
-    
-    return { upper, middle, lower };
-  };
-
-  // 将tick数据聚合为K线数据
-  const aggregateToCandles = (data: PriceHistoryEntry[], candleSize: number = 5): Array<{
-    tick: number;
-    open: number;
-    high: number;
-    low: number;
-    close: number;
-    volume: number;
-    buyVolume: number;
-    sellVolume: number;
-  }> => {
-    const candles = [];
-    for (let i = 0; i < data.length; i += candleSize) {
-      const slice = data.slice(i, i + candleSize);
-      if (slice.length === 0) continue;
       
-      const prices = slice.map(s => s.price);
-      candles.push({
-        tick: slice[0].tick,
-        open: slice[0].price,
-        high: Math.max(...prices),
-        low: Math.min(...prices),
-        close: slice[slice.length - 1].price,
-        volume: slice.reduce((sum, s) => sum + (s.volume || 0), 0),
-        buyVolume: slice.reduce((sum, s) => sum + (s.buyVolume || 0), 0),
-        sellVolume: slice.reduce((sum, s) => sum + (s.sellVolume || 0), 0),
-      });
-    }
-    return candles;
-  };
-
-  useEffect(() => {
-    if (!svgRef.current || history.length < 2) return;
-
-    const svg = d3.select(svgRef.current);
-    svg.selectAll('*').remove();
-
-    // 布局参数
-    const volumeHeight = showVolume ? 40 : 0;
-    const pressureHeight = 16;
-    const xAxisHeight = 20; // 时间轴高度
-    const margin = { top: 10, right: 50, bottom: xAxisHeight + 5, left: 50 };
-    const mainHeight = height - volumeHeight - pressureHeight - margin.top - margin.bottom;
-    const innerWidth = width - margin.left - margin.right;
-
-    // 数据准备
-    const prices = history.map(h => h.price);
-    const minPrice = Math.min(...prices) * 0.98;
-    const maxPrice = Math.max(...prices) * 1.02;
-    const ma5 = calculateMA(prices, 5);
-    const ma10 = calculateMA(prices, 10);
-    const bollinger = calculateBollinger(prices, 10, 1.5);
-
-    // 主图表区
-    const mainG = svg.append('g')
-      .attr('transform', `translate(${margin.left},${margin.top})`);
-
-    const xScale = d3.scaleLinear()
-      .domain([0, history.length - 1])
-      .range([0, innerWidth]);
-
-    const yScale = d3.scaleLinear()
-      .domain([minPrice, maxPrice])
-      .range([mainHeight, 0]);
-
-    // 网格线
-    mainG.append('g')
-      .attr('class', 'grid')
-      .selectAll('line')
-      .data([0.2, 0.4, 0.6, 0.8])
-      .join('line')
-      .attr('x1', 0)
-      .attr('x2', innerWidth)
-      .attr('y1', d => mainHeight * d)
-      .attr('y2', d => mainHeight * d)
-      .attr('stroke', '#1e293b')
-      .attr('stroke-dasharray', '2,2');
-
-    // 布林带区域
-    if (showMA) {
-      const bandData: Array<{ x: number; upper: number; lower: number }> = [];
-      history.forEach((_, i) => {
-        if (bollinger.upper[i] !== null && bollinger.lower[i] !== null) {
-          bandData.push({
-            x: xScale(i),
-            upper: yScale(bollinger.upper[i]!),
-            lower: yScale(bollinger.lower[i]!),
-          });
-        }
-      });
-
-      if (bandData.length > 1) {
-        const bandArea = d3.area<{ x: number; upper: number; lower: number }>()
-          .x(d => d.x)
-          .y0(d => d.lower)
-          .y1(d => d.upper)
-          .curve(d3.curveMonotoneX);
-
-        mainG.append('path')
-          .datum(bandData)
-          .attr('fill', '#4338ca')
-          .attr('fill-opacity', 0.15)
-          .attr('d', bandArea);
-      }
-    }
-
-    if (chartMode === 'line') {
-      // 折线图模式
-      // 渐变区域
-      const areaGenerator = d3.area<PriceHistoryEntry>()
-        .x((_, i) => xScale(i))
-        .y0(mainHeight)
-        .y1(d => yScale(d.price))
-        .curve(d3.curveMonotoneX);
-
-      const gradient = svg.append('defs')
-        .append('linearGradient')
-        .attr('id', 'price-gradient-pro')
-        .attr('x1', '0%').attr('y1', '0%')
-        .attr('x2', '0%').attr('y2', '100%');
-      
-      gradient.append('stop')
-        .attr('offset', '0%')
-        .attr('stop-color', '#22d3ee')
-        .attr('stop-opacity', 0.25);
-      
-      gradient.append('stop')
-        .attr('offset', '100%')
-        .attr('stop-color', '#22d3ee')
-        .attr('stop-opacity', 0);
-
-      mainG.append('path')
-        .datum(history)
-        .attr('fill', 'url(#price-gradient-pro)')
-        .attr('d', areaGenerator);
-
-      // 价格线
-      const lineGenerator = d3.line<PriceHistoryEntry>()
-        .x((_, i) => xScale(i))
-        .y(d => yScale(d.price))
-        .curve(d3.curveMonotoneX);
-
-      mainG.append('path')
-        .datum(history)
-        .attr('fill', 'none')
-        .attr('stroke', '#22d3ee')
-        .attr('stroke-width', 2)
-        .attr('d', lineGenerator);
-
-    } else {
-      // K线图模式
-      const candles = aggregateToCandles(history, 5);
-      const candleWidth = Math.max(2, (innerWidth / candles.length) * 0.7);
-
-      const candleXScale = d3.scaleLinear()
-        .domain([0, candles.length - 1])
-        .range([candleWidth / 2, innerWidth - candleWidth / 2]);
-
-      candles.forEach((candle, i) => {
-        const isUp = candle.close >= candle.open;
-        const color = isUp ? '#22c55e' : '#ef4444';
-        const x = candleXScale(i);
-        const openY = yScale(candle.open);
-        const closeY = yScale(candle.close);
-        const highY = yScale(candle.high);
-        const lowY = yScale(candle.low);
-
-        // 影线
-        mainG.append('line')
-          .attr('x1', x)
-          .attr('x2', x)
-          .attr('y1', highY)
-          .attr('y2', lowY)
-          .attr('stroke', color)
-          .attr('stroke-width', 1);
-
-        // 实体
-        mainG.append('rect')
-          .attr('x', x - candleWidth / 2)
-          .attr('y', Math.min(openY, closeY))
-          .attr('width', candleWidth)
-          .attr('height', Math.max(1, Math.abs(closeY - openY)))
-          .attr('fill', isUp ? color : color)
-          .attr('stroke', color)
-          .attr('stroke-width', 0.5);
-      });
-    }
-
-    // 均线
-    if (showMA) {
-      // MA5
-      const ma5Line = d3.line<number | null>()
-        .defined(d => d !== null)
-        .x((_, i) => xScale(i))
-        .y(d => yScale(d!))
-        .curve(d3.curveMonotoneX);
-
-      mainG.append('path')
-        .datum(ma5)
-        .attr('fill', 'none')
-        .attr('stroke', '#f59e0b')
-        .attr('stroke-width', 1)
-        .attr('stroke-dasharray', '3,2')
-        .attr('d', ma5Line);
-
-      // MA10
-      mainG.append('path')
-        .datum(ma10)
-        .attr('fill', 'none')
-        .attr('stroke', '#ec4899')
-        .attr('stroke-width', 1)
-        .attr('stroke-dasharray', '3,2')
-        .attr('d', d3.line<number | null>()
-          .defined(d => d !== null)
-          .x((_, i) => xScale(i))
-          .y(d => yScale(d!))
-          .curve(d3.curveMonotoneX));
-    }
-
-    // 当前价格点
-    const lastPoint = history[history.length - 1];
-    mainG.append('circle')
-      .attr('cx', xScale(history.length - 1))
-      .attr('cy', yScale(lastPoint.price))
-      .attr('r', 4)
-      .attr('fill', '#22d3ee')
-      .attr('stroke', '#0d1117')
-      .attr('stroke-width', 2);
-
-    // 当前价格标签
-    mainG.append('rect')
-      .attr('x', innerWidth + 2)
-      .attr('y', yScale(lastPoint.price) - 8)
-      .attr('width', 45)
-      .attr('height', 16)
-      .attr('fill', '#22d3ee')
-      .attr('rx', 2);
-
-    mainG.append('text')
-      .attr('x', innerWidth + 24)
-      .attr('y', yScale(lastPoint.price) + 4)
-      .attr('text-anchor', 'middle')
-      .attr('fill', '#000')
-      .attr('font-size', '10px')
-      .attr('font-weight', 'bold')
-      .text(`¥${(lastPoint.price / 100).toFixed(1)}`);
-
-    // Y轴
-    const yAxis = d3.axisLeft(yScale)
-      .ticks(4)
-      .tickFormat(d => `¥${((d as number) / 100).toFixed(0)}`);
-    
-    mainG.append('g')
-      .attr('class', 'y-axis')
-      .call(yAxis)
-      .selectAll('text')
-      .attr('fill', '#64748b')
-      .attr('font-size', '9px');
-
-    mainG.selectAll('.y-axis path, .y-axis line').attr('stroke', '#334155');
-
-    // X轴（时间轴）
-    const tickFormat = (i: number) => {
-      const point = history[i];
-      if (!point) return '';
-      const tick = point.tick;
-      // 将 tick 转换为时间格式（1 tick = 1 分钟）
-      const hours = Math.floor(tick / 60);
-      const minutes = tick % 60;
-      if (history.length > 500) {
-        // 数据量大时只显示小时
-        return `${hours}小时`;
-      }
-      // 显示格式：Xh:XXm 或 XXm（不足1小时）
-      if (hours > 0) {
-        return `${hours}h${minutes.toString().padStart(2, '0')}m`;
-      }
-      return `${minutes}m`;
-    };
-    
-    // 计算合适的 tick 数量
-    const numTicks = Math.min(6, Math.max(3, Math.floor(innerWidth / 80)));
-    const tickStep = Math.max(1, Math.floor(history.length / numTicks));
-    const tickIndices: number[] = [];
-    for (let i = 0; i < history.length; i += tickStep) {
-      tickIndices.push(i);
-    }
-    // 确保最后一个点也有标记
-    if (tickIndices[tickIndices.length - 1] !== history.length - 1 && history.length > 1) {
-      tickIndices.push(history.length - 1);
-    }
-    
-    const xAxisG = mainG.append('g')
-      .attr('class', 'x-axis')
-      .attr('transform', `translate(0,${mainHeight})`);
-    
-    // 绘制 X 轴刻度线和标签
-    tickIndices.forEach(i => {
-      const x = xScale(i);
-      // 刻度线
-      xAxisG.append('line')
-        .attr('x1', x)
-        .attr('x2', x)
-        .attr('y1', 0)
-        .attr('y2', 4)
-        .attr('stroke', '#334155');
-      // 标签
-      xAxisG.append('text')
-        .attr('x', x)
-        .attr('y', 14)
-        .attr('text-anchor', 'middle')
-        .attr('fill', '#64748b')
-        .attr('font-size', '8px')
-        .text(tickFormat(i));
-    });
-    
-    // X 轴基线
-    xAxisG.append('line')
-      .attr('x1', 0)
-      .attr('x2', innerWidth)
-      .attr('y1', 0)
-      .attr('y2', 0)
-      .attr('stroke', '#334155');
-
-    // 成交量柱状图
-    if (showVolume) {
-      const volumeG = svg.append('g')
-        .attr('transform', `translate(${margin.left},${margin.top + mainHeight + 4})`);
-
-      const volumes = history.map(h => h.volume || 0);
-      const maxVolume = Math.max(...volumes, 1);
-
-      const volumeYScale = d3.scaleLinear()
-        .domain([0, maxVolume])
-        .range([volumeHeight - 8, 0]);
-
-      const barWidth = Math.max(1, innerWidth / history.length - 1);
-
-      history.forEach((point, i) => {
-        const buyVol = point.buyVolume || 0;
-        const sellVol = point.sellVolume || 0;
-        const totalVol = buyVol + sellVol;
-        if (totalVol === 0) return;
-
-        const barH = volumeHeight - 8 - volumeYScale(totalVol);
-        const buyRatio = buyVol / totalVol;
-
-        // 买入量（绿色）
-        volumeG.append('rect')
-          .attr('x', xScale(i) - barWidth / 2)
-          .attr('y', volumeYScale(totalVol))
-          .attr('width', barWidth)
-          .attr('height', barH * buyRatio)
-          .attr('fill', '#22c55e')
-          .attr('opacity', 0.7);
-
-        // 卖出量（红色）
-        volumeG.append('rect')
-          .attr('x', xScale(i) - barWidth / 2)
-          .attr('y', volumeYScale(totalVol) + barH * buyRatio)
-          .attr('width', barWidth)
-          .attr('height', barH * (1 - buyRatio))
-          .attr('fill', '#ef4444')
-          .attr('opacity', 0.7);
-      });
-
-      // 成交量标签
-      volumeG.append('text')
-        .attr('x', -4)
-        .attr('y', volumeHeight / 2)
-        .attr('text-anchor', 'end')
-        .attr('fill', '#64748b')
-        .attr('font-size', '8px')
-        .text('VOL');
-    }
-
-    // 买卖压力条
-    const pressureG = svg.append('g')
-      .attr('transform', `translate(${margin.left},${height - pressureHeight})`);
-
-    const totalBuy = history.reduce((sum, h) => sum + (h.buyVolume || 0), 0);
-    const totalSell = history.reduce((sum, h) => sum + (h.sellVolume || 0), 0);
-    const total = totalBuy + totalSell;
-
-    if (total > 0) {
-      const buyRatio = totalBuy / total;
-
-      // 买压（绿色）
-      pressureG.append('rect')
-        .attr('x', 0)
-        .attr('y', 2)
-        .attr('width', innerWidth * buyRatio)
-        .attr('height', 10)
-        .attr('fill', '#22c55e')
-        .attr('rx', 2);
-
-      // 卖压（红色）
-      pressureG.append('rect')
-        .attr('x', innerWidth * buyRatio)
-        .attr('y', 2)
-        .attr('width', innerWidth * (1 - buyRatio))
-        .attr('height', 10)
-        .attr('fill', '#ef4444')
-        .attr('rx', 2);
-
-      // 标签
-      pressureG.append('text')
-        .attr('x', 4)
-        .attr('y', 10)
-        .attr('fill', '#fff')
-        .attr('font-size', '8px')
-        .attr('font-weight', 'bold')
-        .text(`买 ${(buyRatio * 100).toFixed(0)}%`);
-
-      pressureG.append('text')
-        .attr('x', innerWidth - 4)
-        .attr('y', 10)
-        .attr('text-anchor', 'end')
-        .attr('fill', '#fff')
-        .attr('font-size', '8px')
-        .attr('font-weight', 'bold')
-        .text(`卖 ${((1 - buyRatio) * 100).toFixed(0)}%`);
-    } else {
-      // 无成交量时显示灰色背景和提示
-      pressureG.append('rect')
-        .attr('x', 0)
-        .attr('y', 2)
-        .attr('width', innerWidth)
-        .attr('height', 10)
-        .attr('fill', '#334155')
-        .attr('rx', 2);
-
-      pressureG.append('text')
-        .attr('x', innerWidth / 2)
-        .attr('y', 10)
-        .attr('text-anchor', 'middle')
-        .attr('fill', '#64748b')
-        .attr('font-size', '8px')
-        .text('暂无成交量数据');
-    }
-
-  }, [history, width, height, chartMode, showMA, showVolume]);
-
-  if (history.length < 2) {
-    return (
-      <div className="flex items-center justify-center text-gray-500 text-sm" style={{ width, height }}>
-        等待价格数据...
-      </div>
-    );
-  }
-
-  return (
-    <div className="relative">
-      {/* 控制按钮 */}
-      <div className="absolute top-0 right-0 flex gap-1 z-10">
-        <button
-          onClick={() => setChartMode(chartMode === 'line' ? 'candlestick' : 'line')}
-          className={`px-1.5 py-0.5 text-[10px] rounded transition-colors ${
-            chartMode === 'candlestick'
-              ? 'bg-orange-600 text-white'
-              : 'bg-slate-700 text-gray-400 hover:bg-slate-600'
-          }`}
-          title="切换K线/折线"
-        >
-          {chartMode === 'line' ? '📈' : '📊'}
-        </button>
-        <button
-          onClick={() => setShowMA(!showMA)}
-          className={`px-1.5 py-0.5 text-[10px] rounded transition-colors ${
-            showMA
-              ? 'bg-purple-600 text-white'
-              : 'bg-slate-700 text-gray-400 hover:bg-slate-600'
-          }`}
-          title="显示/隐藏均线"
-        >
-          MA
-        </button>
-        <button
-          onClick={() => setShowVolume(!showVolume)}
-          className={`px-1.5 py-0.5 text-[10px] rounded transition-colors ${
-            showVolume
-              ? 'bg-cyan-600 text-white'
-              : 'bg-slate-700 text-gray-400 hover:bg-slate-600'
-          }`}
-          title="显示/隐藏成交量"
-        >
-          VOL
-        </button>
+      {/* 价差骨架 */}
+      <div className="flex items-center justify-center gap-1 py-0.5">
+        <Skeleton className="w-16 h-3" />
       </div>
       
-      {/* 图例 */}
-      {showMA && (
-        <div className="absolute top-0 left-0 flex gap-2 text-[9px]">
-          <span className="text-orange-400">— MA5</span>
-          <span className="text-pink-400">— MA10</span>
-          <span className="text-indigo-400/60">▒ 布林带</span>
+      {/* 买单区域骨架 */}
+      <div className="bg-green-900/15 rounded p-1.5 border border-green-800/20">
+        <div className="flex items-center justify-between text-[10px] text-green-400 mb-1">
+          <span>🟢 买方报价</span>
+          <Skeleton className="w-8 h-3" />
         </div>
-      )}
-      
-      <svg ref={svgRef} width={width} height={height} />
+        <div className="space-y-0.5">
+          {[...Array(5)].map((_, i) => (
+            <div key={i} className="grid grid-cols-4 gap-1 px-1 py-0.5">
+              <Skeleton className="h-4" />
+              <Skeleton className="h-4" />
+              <Skeleton className="h-4" />
+              <Skeleton className="h-4" />
+            </div>
+          ))}
+        </div>
+      </div>
     </div>
   );
-}
+});
 
-// ============ 建筑关联区域组件 ============
+// ============ 建筑关联区域组件（使用 memo 优化） ============
 interface BuildingRelationSectionProps {
   title: string;
   subtitle: string;
@@ -753,7 +185,7 @@ interface BuildingRelationSectionProps {
   playerBuildings: Map<EntityId, BuildingInstance>;
 }
 
-function BuildingRelationSection({
+const BuildingRelationSection = memo(function BuildingRelationSection({
   title,
   subtitle,
   relations,
@@ -827,7 +259,7 @@ function BuildingRelationSection({
       </div>
     </div>
   );
-}
+});
 
 // ============ 主组件 ============
 export function EconomyCenter() {
@@ -1312,10 +744,10 @@ export function EconomyCenter() {
               </div>
             </div>
             
-            {/* 价格走势图 - 使用响应式宽度 */}
+            {/* 价格走势图 - 使用 Canvas GPU 加速版本 */}
             <div className="p-4 border-b border-slate-700">
               <div className="text-sm font-medium text-gray-400 mb-2">📈 价格走势</div>
-              <PriceChartWrapper history={selectedHistory} />
+              <PriceChartWrapperCanvas history={selectedHistory} />
             </div>
             
             {/* 生产/消耗建筑 + 标签 */}
@@ -1371,13 +803,13 @@ export function EconomyCenter() {
       {/* ========== 右栏：交易操作 ========== */}
       <div className="w-80 flex flex-col overflow-y-auto bg-slate-800/30">
         {/* 订单簿 - 紧凑版 */}
-        <div className="p-2 border-b border-slate-700">
+        <div className="p-2 border-b border-slate-700" style={{ minHeight: '280px' }}>
           <div className="flex items-center justify-between mb-1">
             <div className="text-xs font-medium text-gray-400">📊 市场挂单</div>
-            <div className="text-[10px] text-gray-500">点击接受报价</div>
+            <div className="text-[10px] text-gray-500">{loading ? '' : '点击接受报价'}</div>
           </div>
           {loading ? (
-            <div className="text-center py-2 text-gray-500 text-xs">加载中...</div>
+            <OrderBookSkeleton />
           ) : (
             <div className="space-y-1">
               {/* 卖单区域 */}

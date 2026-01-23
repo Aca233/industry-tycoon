@@ -21,3 +21,6 @@ export * from './trade.js';
 
 // POPs system types (Victoria 3 style)
 export * from './pops.js';
+
+// Stock market types (Phase 32)
+export * from './stock.js';

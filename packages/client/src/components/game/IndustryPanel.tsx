@@ -1,13 +1,19 @@
 /**
  * IndustryPanel - 工业产能概览面板
  * 提供直观的建筑管理和产业链视图
+ *
+ * 性能优化：
+ * - 使用 React.memo 包装子组件避免不必要的重渲染
+ * - 使用 useMemo 缓存计算结果
+ * - 使用 useCallback 缓存回调函数
  */
 
-import { useState, useMemo, useCallback } from 'react';
+import { useState, useMemo, useCallback, memo } from 'react';
 import { useGameStore, useMarketPrices, useBuildingShortages, useInventory, useNavigateToEconomyGoods, type FinancialSummary, type BuildingProfit, type BuildingShortage, type InventorySnapshot } from '../../stores';
 import { BUILDINGS_MAP, GOODS_MAP, type BuildingData, type ProductionMethodData, type ProductionSlotData } from '@scc/shared';
 import type { EntityId, BuildingInstance } from '@scc/shared';
 import { gameWebSocket } from '../../services/websocket';
+import { formatMoney } from '../../utils/formatters';
 
 // 获取生产方式的简短图标表示
 const getMethodIcon = (method: ProductionMethodData): string => {
@@ -51,19 +57,7 @@ const getGoodsIcon = (goodsId: string): string => {
   return goods?.icon || '📦';
 };
 
-// 格式化金额
-const formatMoney = (cents: number | undefined | null): string => {
-  // Handle undefined, null, or NaN values
-  if (cents === undefined || cents === null || !Number.isFinite(cents)) {
-    return '¥0';
-  }
-  if (Math.abs(cents) >= 100000000) {
-    return `¥${(cents / 100000000).toFixed(1)}亿`;
-  } else if (Math.abs(cents) >= 10000) {
-    return `¥${(cents / 10000).toFixed(0)}万`;
-  }
-  return `¥${cents}`;
-};
+// formatMoney 现在从 utils/formatters 导入
 
 // 停工状态配置
 const SHUTDOWN_STATUS_CONFIG = {
@@ -141,9 +135,10 @@ function getShutdownInfo(status: string): typeof SHUTDOWN_STATUS_CONFIG[keyof ty
 }
 
 // 停工建筑警告面板（综合所有停工类型）
-function ShutdownAlertPanel() {
+const ShutdownAlertPanel = memo(function ShutdownAlertPanel() {
   const buildings = useGameStore((state) => state.buildings);
   const buildingShortages = useBuildingShortages();
+  const navigateToEconomyGoods = useNavigateToEconomyGoods();
   
   // 收集所有停工建筑
   const shutdownBuildings = useMemo(() => {
@@ -256,7 +251,7 @@ function ShutdownAlertPanel() {
                 </span>
               </div>
               
-              {/* 显示缺少的原料 */}
+              {/* 显示缺少的原料（可点击跳转到商品详情） */}
               {b.missingInputs && b.missingInputs.length > 0 && (
                 <div className="flex flex-wrap gap-2">
                   {b.missingInputs.map((input) => {
@@ -265,11 +260,12 @@ function ShutdownAlertPanel() {
                     return (
                       <div
                         key={input.goodsId}
-                        className="flex items-center gap-1 bg-red-800/30 px-2 py-1 rounded text-xs"
-                        title={`需要 ${input.needed.toFixed(1)}，当前 ${input.available.toFixed(1)}，差 ${shortageAmount.toFixed(1)}`}
+                        className="flex items-center gap-1 bg-red-800/30 px-2 py-1 rounded text-xs cursor-pointer hover:bg-red-700/40 transition-colors"
+                        title={`点击查看商品详情 | 需要 ${input.needed.toFixed(1)}，当前 ${input.available.toFixed(1)}，差 ${shortageAmount.toFixed(1)}`}
+                        onClick={() => navigateToEconomyGoods(input.goodsId)}
                       >
                         <span>{icon}</span>
-                        <span className="text-red-300">{input.goodsName}</span>
+                        <span className="text-red-300 hover:underline">{input.goodsName}</span>
                         <span className="text-red-400 font-mono">
                           缺{shortageAmount.toFixed(0)}
                         </span>
@@ -293,10 +289,10 @@ function ShutdownAlertPanel() {
       </div>
     </div>
   );
-}
+});
 
 // 产能总览卡片
-function CapacitySummaryCard({
+const CapacitySummaryCard = memo(function CapacitySummaryCard({
   buildings,
   financials
 }: {
@@ -415,7 +411,7 @@ function CapacitySummaryCard({
       </div>
     </div>
   );
-}
+});
 
 /** 合并后的建筑组数据 */
 interface BuildingGroup {
@@ -429,7 +425,7 @@ interface BuildingGroup {
 }
 
 // 原材料/产品流程图组件 - 显示名称版
-function RecipeFlowDiagram({
+const RecipeFlowDiagram = memo(function RecipeFlowDiagram({
   inputs,
   outputs,
   count,
@@ -543,7 +539,7 @@ function RecipeFlowDiagram({
       </div>
     </div>
   );
-}
+});
 
 // 生产方式选择组件（Victoria 3 风格）
 function ProductionMethodSelector({
@@ -654,6 +650,9 @@ function ProductionMethodSelector({
   );
 }
 
+// 使用 memo 包装 ProductionMethodSelector
+const MemoizedProductionMethodSelector = memo(ProductionMethodSelector);
+
 // 合并建筑组行组件
 function BuildingGroupRow({
   group,
@@ -736,7 +735,7 @@ function BuildingGroupRow({
           
           {/* 生产方式选择器（Victoria 3 风格） */}
           {activeSlot && (
-            <ProductionMethodSelector
+            <MemoizedProductionMethodSelector
               slot={activeSlot}
               activeMethodId={activeMethodId || activeSlot.defaultMethodId}
               buildingId={firstBuilding.id}
@@ -791,8 +790,11 @@ function BuildingGroupRow({
   );
 }
 
+// 使用 memo 包装 BuildingGroupRow
+const MemoizedBuildingGroupRow = memo(BuildingGroupRow);
+
 // 主面板组件
-export function IndustryPanel() {
+export const IndustryPanel = memo(function IndustryPanel() {
   const [selectedCategory, setSelectedCategory] = useState<CategoryKey | 'all'>('all');
   const [sortBy, setSortBy] = useState<'name' | 'profit' | 'count'>('name');
   
@@ -817,10 +819,6 @@ export function IndustryPanel() {
       }
     }
     
-    // 调试日志：检查 BUILDINGS_MAP 和 buildings
-    console.log('[IndustryPanel] BUILDINGS_MAP size:', BUILDINGS_MAP.size);
-    console.log('[IndustryPanel] buildings size:', buildings.size);
-    
     // 首先按 definitionId 分组
     const buildingsByDef = new Map<string, {
       buildings: BuildingInstance[];
@@ -829,13 +827,8 @@ export function IndustryPanel() {
     }>();
     
     for (const building of buildings.values()) {
-      console.log('[IndustryPanel] Building definitionId:', building.definitionId, 'id:', building.id);
       const def = BUILDINGS_MAP.get(building.definitionId);
-      if (!def) {
-        console.warn('[IndustryPanel] Building definition not found:', building.definitionId);
-        console.log('[IndustryPanel] Available definitions:', Array.from(BUILDINGS_MAP.keys()).slice(0, 10));
-        continue;
-      }
+      if (!def) continue;
       
       let group = buildingsByDef.get(building.definitionId);
       if (!group) {
@@ -1001,14 +994,14 @@ export function IndustryPanel() {
               
               <div className="space-y-3">
                 {groups.map((group) => (
-                  <BuildingGroupRow
+                  <MemoizedBuildingGroupRow
                     key={group.definitionId}
                     group={group}
                     marketPrices={marketPrices}
                     inventory={inventory}
                     onAddBuilding={handleAddBuilding}
                     onRemoveBuilding={handleRemoveBuilding}
-                    onSelectBuilding={(buildingId) => selectBuilding(buildingId)}
+                    onSelectBuilding={(buildingId: string) => selectBuilding(buildingId)}
                     onGoodsClick={handleGoodsClick}
                   />
                 ))}
@@ -1028,4 +1021,4 @@ export function IndustryPanel() {
       </div>
     </div>
   );
-}
+});

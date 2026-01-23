@@ -1,19 +1,27 @@
 /**
  * Game constants and configuration values
+ *
+ * 统一时间体系：1 tick = 1小时
+ * - 游戏以"小时"为最小时间单位
+ * - 1天 = 24 ticks
+ * - 1月 = 720 ticks (30天)
+ * - 实时200ms/tick，1x速度下1游戏天约5分钟
  */
 
-/** Time and tick settings */
+/** Time and tick settings (1 tick = 1 hour) */
 export const TIME_CONSTANTS = {
-  /** Ticks per in-game day */
+  /** Ticks per in-game hour (基本单位) */
+  TICKS_PER_HOUR: 1,
+  /** Ticks per in-game day (24 hours) */
   TICKS_PER_DAY: 24,
-  /** Ticks per in-game week */
+  /** Ticks per in-game week (7 days) */
   TICKS_PER_WEEK: 168,
   /** Ticks per in-game month (30 days) */
   TICKS_PER_MONTH: 720,
-  /** Ticks per in-game year */
+  /** Ticks per in-game year (365 days) */
   TICKS_PER_YEAR: 8760,
   /** Default real-time milliseconds per tick at normal speed */
-  MS_PER_TICK_NORMAL: 1000,
+  MS_PER_TICK_NORMAL: 200,
 } as const;
 
 /** Economic constants */

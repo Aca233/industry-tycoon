@@ -30,12 +30,18 @@ interface GoodsPriceState {
 
 /**
  * 价格发现服务 - 单例
+ *
+ * 性能优化：
+ * - 延迟清理价格历史，减少 slice 操作频率
+ * - 使用清理阈值避免每次添加都触发清理
  */
 export class PriceDiscoveryService extends EventEmitter {
   /** 商品价格状态 */
   private priceStates: Map<string, GoodsPriceState> = new Map();
   /** 历史记录保留点数 */
   private readonly MAX_HISTORY_POINTS = 1000;
+  /** 历史记录清理阈值（超过此值才触发清理） */
+  private readonly CLEANUP_THRESHOLD = 1200;
   /** 最大价格波动比例（每tick） - 降低到2%防止价格暴涨 */
   private readonly MAX_PRICE_CHANGE = 0.02; // 2% per tick (was 10%)
   /** 价格最高为基准价的5倍 */
@@ -182,9 +188,11 @@ export class PriceDiscoveryService extends EventEmitter {
   
   /**
    * 记录价格历史点
+   *
+   * 性能优化：延迟清理，只有超过阈值才执行 slice
    */
   private recordPricePoint(state: GoodsPriceState, tick: number, depth: MarketDepth): void {
-    // 获取成交量
+    // 获取成交量（现在使用缓存，O(1)）
     const volume = matchingEngine.getVolume(state.goodsId, tick - 1, tick);
     
     const point: PriceHistoryPoint = {
@@ -197,8 +205,8 @@ export class PriceDiscoveryService extends EventEmitter {
     
     state.priceHistory.push(point);
     
-    // 限制历史记录大小
-    if (state.priceHistory.length > this.MAX_HISTORY_POINTS) {
+    // 延迟清理：只有超过阈值才触发，减少 slice 频率
+    if (state.priceHistory.length > this.CLEANUP_THRESHOLD) {
       state.priceHistory = state.priceHistory.slice(-this.MAX_HISTORY_POINTS);
     }
   }

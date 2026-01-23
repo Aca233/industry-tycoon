@@ -787,6 +787,310 @@ class ApiClient {
       body: JSON.stringify(config),
     });
   }
+
+  // ============================================
+  // Stock Market API (Phase 32)
+  // ============================================
+
+  /** Get all stocks */
+  async getStocks() {
+    return this.request<{
+      success: boolean;
+      data: {
+        stocks: Array<{
+          companyId: string;
+          ticker: string;
+          totalShares: number;
+          floatingShares: number;
+          currentPrice: number;
+          openPrice: number;
+          highPrice: number;
+          lowPrice: number;
+          previousClose: number;
+          marketCap: number;
+          peRatio: number;
+          pbRatio: number;
+          eps: number;
+          bookValuePerShare: number;
+          dividendYield: number;
+          priceChangePercent: number;
+          volume: number;
+          turnover: number;
+          status: string;
+          listedTick: number;
+        }>;
+        marketState: {
+          marketIndex: number;
+          indexBase: number;
+          sentiment: string;
+          dailyTurnover: number;
+          advancers: number;
+          decliners: number;
+          unchanged: number;
+          limitUpStocks: string[];
+          limitDownStocks: string[];
+          isOpen: boolean;
+          openTick: number;
+          closeTick: number;
+        };
+      };
+    }>('/api/v1/stocks');
+  }
+
+  /** Get single stock details */
+  async getStockDetail(stockId: string) {
+    return this.request<{
+      success: boolean;
+      data: {
+        stock: {
+          companyId: string;
+          ticker: string;
+          totalShares: number;
+          floatingShares: number;
+          currentPrice: number;
+          openPrice: number;
+          highPrice: number;
+          lowPrice: number;
+          previousClose: number;
+          marketCap: number;
+          peRatio: number;
+          pbRatio: number;
+          eps: number;
+          bookValuePerShare: number;
+          dividendYield: number;
+          priceChangePercent: number;
+          volume: number;
+          turnover: number;
+          status: string;
+          listedTick: number;
+        };
+        priceHistory: Array<{
+          tick: number;
+          open: number;
+          high: number;
+          low: number;
+          close: number;
+          volume: number;
+          turnover: number;
+        }>;
+        stockholders: Array<{
+          holderId: string;
+          companyId: string;
+          shares: number;
+          sharePercent: number;
+          costBasis: number;
+          avgCostPrice: number;
+          type: string;
+        }>;
+        recentTrades: Array<{
+          id: string;
+          stockId: string;
+          buyerId: string;
+          sellerId: string;
+          price: number;
+          quantity: number;
+          value: number;
+          tick: number;
+        }>;
+        valuation: {
+          companyId: string;
+          assetBasedValue: number;
+          earningsBasedValue: number;
+          fairValue: number;
+          marketPrice: number;
+          premiumDiscount: number;
+          rating: string;
+        } | null;
+      };
+    }>(`/api/v1/stocks/${stockId}`);
+  }
+
+  /** Get stock price history */
+  async getStockPriceHistory(stockId: string, limit?: number) {
+    const query = limit ? `?limit=${limit}` : '';
+    return this.request<{
+      success: boolean;
+      data: Array<{
+        tick: number;
+        open: number;
+        high: number;
+        low: number;
+        close: number;
+        volume: number;
+        turnover: number;
+      }>;
+    }>(`/api/v1/stocks/${stockId}/history${query}`);
+  }
+
+  /** Get stockholdings for a company */
+  async getStockHoldings(holderId: string) {
+    return this.request<{
+      success: boolean;
+      data: Array<{
+        holderId: string;
+        companyId: string;
+        shares: number;
+        sharePercent: number;
+        costBasis: number;
+        avgCostPrice: number;
+        type: string;
+        currentPrice: number;
+        marketValue: number;
+        unrealizedPnL: number;
+        pnLPercent: number;
+        ticker: string;
+      }>;
+    }>(`/api/v1/stocks/holdings/${holderId}`);
+  }
+
+  /** Submit stock order */
+  async submitStockOrder(
+    companyId: string,
+    stockId: string,
+    orderType: 'market' | 'limit',
+    side: 'buy' | 'sell',
+    quantity: number,
+    limitPrice?: number
+  ) {
+    return this.request<{
+      success: boolean;
+      data: {
+        success: boolean;
+        order?: {
+          id: string;
+          companyId: string;
+          stockId: string;
+          orderType: string;
+          side: string;
+          quantity: number;
+          filledQuantity: number;
+          remainingQuantity: number;
+          limitPrice?: number;
+          status: string;
+          createdTick: number;
+          expiryTick: number;
+        };
+        error?: string;
+      };
+    }>('/api/v1/stocks/order', {
+      method: 'POST',
+      body: JSON.stringify({ companyId, stockId, orderType, side, quantity, limitPrice }),
+    });
+  }
+
+  /** Cancel stock order */
+  async cancelStockOrder(stockId: string, orderId: string) {
+    return this.request<{
+      success: boolean;
+      message?: string;
+      error?: string;
+    }>(`/api/v1/stocks/order/${stockId}/${orderId}`, {
+      method: 'DELETE',
+    });
+  }
+
+  /** Get market state */
+  async getMarketState() {
+    return this.request<{
+      success: boolean;
+      data: {
+        marketIndex: number;
+        indexBase: number;
+        sentiment: string;
+        dailyTurnover: number;
+        advancers: number;
+        decliners: number;
+        unchanged: number;
+        limitUpStocks: string[];
+        limitDownStocks: string[];
+        isOpen: boolean;
+        openTick: number;
+        closeTick: number;
+      };
+    }>('/api/v1/stocks/market/state');
+  }
+
+  /** Get recent stock trades */
+  async getRecentStockTrades(stockId?: string, limit?: number) {
+    const params = new URLSearchParams();
+    if (stockId) params.append('stockId', stockId);
+    if (limit) params.append('limit', limit.toString());
+    const query = params.toString() ? `?${params.toString()}` : '';
+    return this.request<{
+      success: boolean;
+      data: Array<{
+        id: string;
+        stockId: string;
+        buyerId: string;
+        sellerId: string;
+        price: number;
+        quantity: number;
+        value: number;
+        tick: number;
+      }>;
+    }>(`/api/v1/stocks/trades/recent${query}`);
+  }
+
+  /** Get market depth (order book) */
+  async getMarketDepth(stockId: string, levels: number = 5) {
+    return this.request<{
+      success: boolean;
+      data: {
+        stockId: string;
+        ticker: string;
+        currentPrice: number;
+        bids: Array<{ price: number; volume: number }>;
+        asks: Array<{ price: number; volume: number }>;
+      };
+    }>(`/api/v1/stocks/${stockId}/depth?levels=${levels}`);
+  }
+
+  /** Get orders for a company */
+  async getOrders(companyId: string) {
+    return this.request<{
+      success: boolean;
+      data: Array<{
+        id: string;
+        companyId: string;
+        stockId: string;
+        orderType: string;
+        side: string;
+        quantity: number;
+        filledQuantity: number;
+        remainingQuantity: number;
+        limitPrice?: number;
+        status: string;
+        createdTick: number;
+        expiryTick: number;
+        ticker: string;
+        currentPrice: number;
+      }>;
+    }>(`/api/v1/stocks/orders/${companyId}`);
+  }
+
+  /** Initiate takeover bid */
+  async initiateTakeover(acquirerId: string, targetId: string, offerPrice: number, rationale?: string) {
+    return this.request<{
+      success: boolean;
+      data?: {
+        id: string;
+        acquirerId: string;
+        targetId: string;
+        offerPrice: number;
+        premium: number;
+        status: string;
+        initiatedTick: number;
+        expiryTick: number;
+        rationale: string;
+        hostile: boolean;
+        defenseActivated: boolean;
+      };
+      error?: string;
+    }>('/api/v1/stocks/takeover', {
+      method: 'POST',
+      body: JSON.stringify({ acquirerId, targetId, offerPrice, rationale }),
+    });
+  }
 }
 
 // WebSocket connection manager

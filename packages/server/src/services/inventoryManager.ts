@@ -342,7 +342,7 @@ export class InventoryManager extends EventEmitter {
     
     // 玩家公司的交易记录详细日志
     if (sellerCompanyId.startsWith('player') || inventory.companyType === CompanyType.Player) {
-      console.log(`[InventoryManager] 💰 玩家销售成功: ${quantity.toFixed(2)} ${goodsId} @ ${salePrice.toFixed(2)} = +$${cashReceived.toFixed(2)} (现金: $${previousCash.toFixed(2)} -> $${inventory.cash.toFixed(2)})`);
+      console.log(`[InventoryManager] 💰 玩家销售成功: ${quantity.toFixed(2)} ${goodsId} @ ¥${(salePrice / 10000).toFixed(2)}万 = +¥${(cashReceived / 10000).toFixed(2)}万 (现金: ¥${(previousCash / 10000).toFixed(2)}万 -> ¥${(inventory.cash / 10000).toFixed(2)}万)`);
     }
     
     this.recordChange(sellerCompanyId, goodsId, 'trade', -quantity, `sold_${tradeId ?? 'unknown'}`, currentTick, tradeId);

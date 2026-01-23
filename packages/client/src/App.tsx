@@ -1,7 +1,8 @@
 import { useEffect, useState } from 'react';
-import { MarketGalaxy, ProductionCard, NeuralFeed, BuildingShop, FinancialReport, CompetitorPanel, ResearchLab, IndustryPanel, EconomyCenter, SettingsModal } from './components/game';
+import { MarketGalaxy, ProductionCard, NeuralFeed, BuildingShop, FinancialReport, CompetitorPanel, ResearchLab, IndustryPanel, EconomyCenter, SettingsModal, StockMarket } from './components/game';
 import { useGameStore, useActivePanel, usePlayerCompany, useIsPaused, useCurrentTick, useGameSpeed, useFinancials } from './stores';
 import { gameWebSocket } from './services/websocket';
+import { formatMoney, formatGameTime } from './utils/formatters';
 
 export function App() {
   const [gameStarted, setGameStarted] = useState(false);
@@ -67,21 +68,7 @@ export function App() {
     );
   }
 
-  const formatMoney = (amount: number | undefined | null) => {
-    // Handle undefined, null, or NaN values
-    if (amount === undefined || amount === null || !Number.isFinite(amount)) {
-      return '¥0';
-    }
-    // 注意：后端发送的金额单位是"元"（不是分），所以不需要除以100
-    return new Intl.NumberFormat('zh-CN', {
-      style: 'currency',
-      currency: 'CNY',
-      minimumFractionDigits: 0,
-      maximumFractionDigits: 0,
-    }).format(amount);
-  };
-
-  const getDayFromTick = (tick: number) => Math.floor(tick / 24) + 1;
+  // formatMoney 和 formatGameTime 现在从 utils/formatters 导入
 
   return (
     <div className="h-screen w-screen bg-slate-900 flex overflow-hidden">
@@ -147,6 +134,12 @@ export function App() {
               label="经济管理中心"
               active={activePanel === 'economy'}
               onClick={() => setActivePanel('economy')}
+            />
+            <NavItem
+              icon="📈"
+              label="股票市场"
+              active={activePanel === 'stocks'}
+              onClick={() => setActivePanel('stocks')}
             />
           </div>
         </nav>
@@ -216,6 +209,11 @@ export function App() {
         {activePanel === 'research' && <ResearchLab />}
         {activePanel === 'diplomacy' && <CompetitorPanel />}
         {activePanel === 'economy' && <EconomyCenter />}
+        {activePanel === 'stocks' && playerCompany && (
+          <div className="h-full p-4 overflow-auto">
+            <StockMarket gameId="game-1" playerCompanyId={playerCompany.id} />
+          </div>
+        )}
         
         {/* Bottom Bar - Time Controls */}
         <div className="absolute bottom-0 left-0 right-0 h-16 bg-slate-800/90 backdrop-blur border-t border-slate-700 flex items-center justify-between px-6">
@@ -254,7 +252,7 @@ export function App() {
             </button>
           </div>
           <div className="text-white flex items-center gap-4">
-            <span className="text-gray-400">第 {getDayFromTick(currentTick)} 天</span>
+            <span className="text-gray-400">{formatGameTime(currentTick, 'full')}</span>
             <span className="text-gray-600">|</span>
             <span className="text-green-400 flex items-center gap-1">
               <span className="w-2 h-2 rounded-full bg-green-400 animate-pulse"></span>

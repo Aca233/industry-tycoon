@@ -34,6 +34,11 @@ export interface MarketShareData {
 
 /**
  * 撮合引擎 - 单例
+ *
+ * 性能优化：
+ * - 使用 lastTradePriceCache 缓存最后交易价格，避免每次遍历历史
+ * - 使用环形缓冲区思想管理历史记录，减少 slice 操作
+ * - 批量清理历史记录而非每次添加时清理
  */
 export class MatchingEngine extends EventEmitter {
   /** 交易ID计数器 */
@@ -42,6 +47,17 @@ export class MatchingEngine extends EventEmitter {
   private tradeHistory: TradeRecord[] = [];
   /** 历史记录保留数量 */
   private readonly MAX_HISTORY_SIZE = 10000;
+  /** 上次清理历史的大小阈值（超过此值才触发清理） */
+  private readonly CLEANUP_THRESHOLD = 12000;
+  
+  /** 最后交易价格缓存 Map<goodsId, lastPrice> */
+  private lastTradePriceCache: Map<string, number> = new Map();
+  /** 最后交易tick缓存 Map<goodsId, tick> */
+  private lastTradeTick: Map<string, number> = new Map();
+  /** 成交量缓存 Map<`${goodsId}-${tick}`, volume> */
+  private volumeCache: Map<string, number> = new Map();
+  /** 成交量缓存最大tick数 */
+  private readonly VOLUME_CACHE_TICKS = 100;
   
   constructor() {
     super();
@@ -149,10 +165,10 @@ export class MatchingEngine extends EventEmitter {
     
     if (buyerIsPlayer || sellerIsPlayer) {
       console.log(`[MatchingEngine] 💰 玩家参与交易:`);
-      console.log(`  商品: ${buyOrder.goodsId}, 数量: ${actualQuantity}, 单价: ${price.toFixed(2)}`);
+      console.log(`  商品: ${buyOrder.goodsId}, 数量: ${actualQuantity}, 单价: ¥${(price / 10000).toFixed(2)}万`);
       console.log(`  买方: ${buyOrder.companyId}${buyerIsPlayer ? ' (玩家)' : ''}`);
       console.log(`  卖方: ${sellOrder.companyId}${sellerIsPlayer ? ' (玩家)' : ''}`);
-      console.log(`  总额: $${totalValue.toFixed(2)}`);
+      console.log(`  总额: ¥${(totalValue / 10000).toFixed(2)}万`);
     } else {
       console.log(`[MatchingEngine] Trade executed: ${actualQuantity} ${buyOrder.goodsId} @ ${price}`);
     }
@@ -277,13 +293,41 @@ export class MatchingEngine extends EventEmitter {
   
   /**
    * 记录交易
+   *
+   * 性能优化：
+   * - 更新缓存而非每次查询时遍历
+   * - 延迟清理历史记录，减少 slice 调用频率
    */
   private recordTrade(trade: TradeRecord): void {
     this.tradeHistory.push(trade);
     
-    // 限制历史记录大小
-    if (this.tradeHistory.length > this.MAX_HISTORY_SIZE) {
+    // 更新最后交易价格缓存（O(1) 操作）
+    this.lastTradePriceCache.set(trade.goodsId, trade.pricePerUnit);
+    this.lastTradeTick.set(trade.goodsId, trade.tick);
+    
+    // 更新成交量缓存
+    const volumeKey = `${trade.goodsId}-${trade.tick}`;
+    const currentVolume = this.volumeCache.get(volumeKey) ?? 0;
+    this.volumeCache.set(volumeKey, currentVolume + trade.quantity);
+    
+    // 延迟清理：只有当历史超过阈值时才清理，减少 slice 调用频率
+    if (this.tradeHistory.length > this.CLEANUP_THRESHOLD) {
       this.tradeHistory = this.tradeHistory.slice(-this.MAX_HISTORY_SIZE);
+      this.cleanupVolumeCache(trade.tick);
+    }
+  }
+  
+  /**
+   * 清理过期的成交量缓存
+   */
+  private cleanupVolumeCache(currentTick: number): void {
+    const minTick = currentTick - this.VOLUME_CACHE_TICKS;
+    for (const key of this.volumeCache.keys()) {
+      const parts = key.split('-');
+      const tick = parseInt(parts[parts.length - 1] ?? '0', 10);
+      if (tick < minTick) {
+        this.volumeCache.delete(key);
+      }
     }
   }
   
@@ -302,17 +346,46 @@ export class MatchingEngine extends EventEmitter {
   
   /**
    * 获取商品的最近成交价
+   *
+   * 性能优化：从缓存读取 O(1)，而非遍历历史 O(n)
    */
   getLastTradePrice(goodsId: string): number | null {
-    const trades = this.tradeHistory.filter(t => t.goodsId === goodsId);
-    if (trades.length === 0) return null;
-    return trades[trades.length - 1]?.pricePerUnit ?? null;
+    return this.lastTradePriceCache.get(goodsId) ?? null;
+  }
+  
+  /**
+   * 获取商品最后交易的tick
+   */
+  getLastTradeTick(goodsId: string): number | null {
+    return this.lastTradeTick.get(goodsId) ?? null;
   }
   
   /**
    * 获取商品的成交量（指定tick范围）
+   *
+   * 性能优化：
+   * - 对于单个tick，直接从缓存读取 O(1)
+   * - 对于短范围，使用缓存加速
+   * - 对于长范围，仍需遍历历史（但这种情况较少）
    */
   getVolume(goodsId: string, startTick: number, endTick: number): number {
+    // 单个tick的情况，直接从缓存读取
+    if (startTick === endTick || endTick - startTick <= 1) {
+      const key = `${goodsId}-${endTick}`;
+      return this.volumeCache.get(key) ?? 0;
+    }
+    
+    // 短范围（<= VOLUME_CACHE_TICKS），从缓存累加
+    if (endTick - startTick <= this.VOLUME_CACHE_TICKS) {
+      let total = 0;
+      for (let tick = startTick; tick <= endTick; tick++) {
+        const key = `${goodsId}-${tick}`;
+        total += this.volumeCache.get(key) ?? 0;
+      }
+      return total;
+    }
+    
+    // 长范围，回退到遍历历史
     return this.tradeHistory
       .filter(t => t.goodsId === goodsId && t.tick >= startTick && t.tick <= endTick)
       .reduce((sum, t) => sum + t.quantity, 0);
@@ -410,6 +483,9 @@ export class MatchingEngine extends EventEmitter {
   reset(): void {
     this.tradeHistory = [];
     this.tradeIdCounter = 0;
+    this.lastTradePriceCache.clear();
+    this.lastTradeTick.clear();
+    this.volumeCache.clear();
     console.log('[MatchingEngine] Reset');
   }
 }

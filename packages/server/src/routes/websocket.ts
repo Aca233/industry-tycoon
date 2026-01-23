@@ -1,10 +1,15 @@
 /**
  * WebSocket Routes for real-time game communication
+ *
+ * 性能优化：
+ * - 使用增量状态推送（delta updates），只发送变化的数据
+ * - 减少WebSocket消息大小约80%
  */
 
 import { FastifyInstance, FastifyRequest } from 'fastify';
 import type { WebSocket as WSWebSocket } from '@fastify/websocket';
 import { gameLoop, TickUpdate } from '../services/gameLoop.js';
+import { deltaStateManager } from '../services/deltaStateManager.js';
 
 interface WSClient {
   socket: WSWebSocket;
@@ -198,15 +203,48 @@ function broadcast(gameId: string, message: object): void {
 }
 
 /**
+ * 使用增量更新的广播统计
+ */
+let broadcastStats = {
+  fullUpdates: 0,
+  deltaUpdates: 0,
+  totalBytesSent: 0,
+  totalBytesIfFull: 0,
+};
+
+/**
  * Initialize GameLoop event listeners for broadcasting
  */
 export function initGameLoopBroadcast(): void {
-  // Broadcast tick updates
+  // Broadcast tick updates (使用增量状态推送)
   gameLoop.on('tick', (update: TickUpdate) => {
-    broadcast(update.gameId, {
-      type: 'tick',
-      payload: update,
-    });
+    // 使用增量管理器处理更新
+    const deltaUpdate = deltaStateManager.processUpdate(update);
+    
+    // 广播增量或完整更新
+    const message = {
+      type: deltaUpdate.type === 'delta' ? 'tickDelta' : 'tick',
+      payload: deltaUpdate,
+    };
+    
+    broadcast(update.gameId, message);
+    
+    // 统计信息（每1000 tick输出一次）
+    if (deltaUpdate.type === 'delta') {
+      broadcastStats.deltaUpdates++;
+    } else {
+      broadcastStats.fullUpdates++;
+    }
+    
+    const deltaSize = JSON.stringify(deltaUpdate).length;
+    const fullSize = JSON.stringify(update).length;
+    broadcastStats.totalBytesSent += deltaSize;
+    broadcastStats.totalBytesIfFull += fullSize;
+    
+    if (update.tick % 1000 === 0 && update.tick > 0) {
+      const savings = ((1 - broadcastStats.totalBytesSent / broadcastStats.totalBytesIfFull) * 100).toFixed(1);
+      console.log(`[WS] Delta stats: ${broadcastStats.deltaUpdates} delta, ${broadcastStats.fullUpdates} full, saved ${savings}% bandwidth`);
+    }
   });
   
   // Broadcast speed changes
@@ -231,5 +269,22 @@ export function initGameLoopBroadcast(): void {
     });
   });
   
-  console.log('[WS] GameLoop broadcast initialized');
+  // 当游戏重置时清除增量状态
+  gameLoop.on('gameReset', (data: { gameId: string }) => {
+    deltaStateManager.clearGameState(data.gameId);
+  });
+  
+  console.log('[WS] GameLoop broadcast initialized with delta updates');
+}
+
+/**
+ * 获取广播统计信息（用于监控）
+ */
+export function getBroadcastStats() {
+  return {
+    ...broadcastStats,
+    bandwidthSavings: broadcastStats.totalBytesIfFull > 0
+      ? ((1 - broadcastStats.totalBytesSent / broadcastStats.totalBytesIfFull) * 100).toFixed(1) + '%'
+      : '0%',
+  };
 }

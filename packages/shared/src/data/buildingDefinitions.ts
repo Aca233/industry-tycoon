@@ -981,6 +981,80 @@ export const BUILDING_DEFINITIONS: Record<string, BuildingDef> = {
     ],
   },
 
+  'plastic-factory': {
+    nameZh: '塑料工厂',
+    name: 'Plastics Factory',
+    category: 'processing',
+    subcategory: '石油化工',
+    description: '将石化原料加工成塑料制品',
+    icon: '🧴',
+    size: 'large',
+    baseCost: 120000000,
+    maintenanceCost: 280000,
+    maxWorkers: 300,
+    templateId: 'PROCESSING',
+    productionSlots: [
+      {
+        type: 'process',
+        name: '生产工艺',
+        defaultMethodId: 'basic-plastic',
+        methods: [
+          {
+            id: 'basic-plastic',
+            nameZh: '基础塑料生产',
+            name: 'Basic Plastic Production',
+            description: '通用塑料颗粒生产',
+            recipe: {
+              inputs: [
+                { goodsId: 'crude-oil', amount: 40 },
+                { goodsId: 'chemicals', amount: 15 },
+              ],
+              outputs: [{ goodsId: 'plastic', amount: 80 }],
+              ticksRequired: 2,
+            },
+            laborRequired: 100,
+            powerRequired: 200,
+            efficiency: 1.0,
+          },
+          {
+            id: 'advanced-plastic',
+            nameZh: '高性能塑料',
+            name: 'Advanced Plastic Production',
+            description: '工程塑料和特种塑料',
+            recipe: {
+              inputs: [
+                { goodsId: 'crude-oil', amount: 30 },
+                { goodsId: 'chemicals', amount: 25 },
+                { goodsId: 'natural-gas', amount: 10 },
+              ],
+              outputs: [{ goodsId: 'plastic', amount: 100 }],
+              ticksRequired: 3,
+            },
+            laborRequired: 120,
+            powerRequired: 280,
+            efficiency: 1.3,
+          },
+          {
+            id: 'recycled-plastic',
+            nameZh: '再生塑料',
+            name: 'Recycled Plastic',
+            description: '环保再生塑料生产',
+            recipe: {
+              inputs: [
+                { goodsId: 'chemicals', amount: 20 },
+              ],
+              outputs: [{ goodsId: 'plastic', amount: 60 }],
+              ticksRequired: 2,
+            },
+            laborRequired: 80,
+            powerRequired: 150,
+            efficiency: 0.9,
+          },
+        ],
+      },
+    ],
+  },
+
   // ============ 高端制造类 (Manufacturing) ============
 
   'chip-fab': {

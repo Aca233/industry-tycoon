@@ -526,6 +526,24 @@ export const AI_COMPANIES_CONFIG: AICompanyConfig[] = [
     rdPreference: 0.4,
   },
   {
+    id: 'ai-tianneng-battery',
+    name: '天能电池',
+    nameEn: 'Tianneng Battery',
+    personality: AIPersonality.Monopolist,
+    initialCash: 480_000_000, // 4.8亿
+    initialBuildings: ['battery-factory', 'battery-factory', 'battery-factory', 'battery-pack-factory'],
+    color: '#16a34a', // 电池绿
+    icon: '🔋',
+    llmPrompt: `你是"天能电池"的CEO，是电池电芯领域的龙头企业。
+你控制着大量电池电芯产能，对新能源汽车和消费电子行业有重要影响力。
+你的目标是垄断电池电芯市场，通过规模效应降低成本并挤压竞争对手。
+你与锂矿供应商有长期战略合作，确保原材料供应稳定。`,
+    decisionInterval: 16,
+    riskTolerance: 0.7,
+    aggressiveness: 0.8,
+    rdPreference: 0.5,
+  },
+  {
     id: 'ai-beichen-sensor',
     name: '北辰传感',
     nameEn: 'Beichen Sensors',

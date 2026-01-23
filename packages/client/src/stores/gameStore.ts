@@ -218,7 +218,7 @@ export interface ClientGameState {
   isAssistantTyping: boolean;
   
   // UI State
-  activePanel: 'industries' | 'market' | 'research' | 'diplomacy' | 'economy';
+  activePanel: 'industries' | 'market' | 'research' | 'diplomacy' | 'economy' | 'stocks';
   showProductionCard: boolean;
   selectedGoodsId: EntityId | null;
   
@@ -385,6 +385,15 @@ export const useGameStore = create<GameStore>()(
         });
         
         gameWebSocket.on('tick', (msg: WSMessage) => {
+          const payload = msg.payload as unknown as TickPayload;
+          if (payload) {
+            get().handleTickUpdate(payload);
+          }
+        });
+        
+        // 处理增量更新（delta update）- 与完整 tick 使用相同的处理逻辑
+        // 服务端在使用增量推送优化时会发送 tickDelta 而不是 tick
+        gameWebSocket.on('tickDelta', (msg: WSMessage) => {
           const payload = msg.payload as unknown as TickPayload;
           if (payload) {
             get().handleTickUpdate(payload);
@@ -610,33 +619,69 @@ export const useGameStore = create<GameStore>()(
         }
         
         // Update market prices and build history (with volume data if available)
-        if (payload.marketPrices) {
+        // 支持增量更新优化：服务端可能发送完整快照(marketPrices)或增量(priceDelta)
+        const tickPayloadWithDelta = payload as unknown as {
+          marketPrices?: Record<string, number>;
+          priceDelta?: Record<string, number>;
+          isFullSnapshot?: boolean;
+          tickVolumes?: Record<string, { total: number; buy: number; sell: number }>;
+        };
+        
+        // 更新当前价格状态
+        if (tickPayloadWithDelta.isFullSnapshot && tickPayloadWithDelta.marketPrices) {
+          // 完整快照：直接替换
+          state.marketPrices = tickPayloadWithDelta.marketPrices;
+        } else if (tickPayloadWithDelta.priceDelta) {
+          // 增量更新：合并变化到现有价格
+          state.marketPrices = { ...state.marketPrices, ...tickPayloadWithDelta.priceDelta };
+        } else if (payload.marketPrices) {
+          // 兼容旧版：没有 isFullSnapshot 标记时当作完整快照处理
           state.marketPrices = payload.marketPrices;
-          
-          // Get volume data from tick payload
-          const tickVolumes = (payload as unknown as { tickVolumes?: Record<string, { total: number; buy: number; sell: number }> }).tickVolumes;
-          
-          // Add to price history
-          const MAX_HISTORY = 100;
-          for (const [goodsId, price] of Object.entries(payload.marketPrices)) {
+        }
+        
+        // ===== 关键修复：每个 tick 都记录所有商品的价格历史 =====
+        // 之前的问题：只有收到增量更新的商品才记录历史
+        // 这导致价格没有变化的商品会缺失数据点，造成图表稀疏
+        // 现在：遍历所有已知价格，确保每个 tick 都有完整记录
+        const tickVolumes = tickPayloadWithDelta.tickVolumes;
+        const MAX_HISTORY = 720; // 30天的数据点（1 tick = 1小时）
+        const CLEANUP_THRESHOLD = 900;
+        
+        // 只有在有价格数据时才记录历史
+        if (Object.keys(state.marketPrices).length > 0) {
+          for (const [goodsId, price] of Object.entries(state.marketPrices)) {
             let history = state.priceHistory.get(goodsId);
             if (!history) {
               history = [];
               state.priceHistory.set(goodsId, history);
             }
             
-            // Include volume data if available
-            const vol = tickVolumes?.[goodsId];
-            history.push({
-              tick: payload.tick,
-              price,
-              volume: vol?.total,
-              buyVolume: vol?.buy,
-              sellVolume: vol?.sell,
-            });
+            // 优化：检查是否已经有这个 tick 的记录（避免重复）
+            // 这在快速重连或数据同步时可能发生
+            const lastEntry = history.length > 0 ? history[history.length - 1] : null;
+            if (lastEntry && lastEntry.tick === payload.tick) {
+              // 更新最后一条记录的价格（可能有更新）
+              lastEntry.price = price;
+              const vol = tickVolumes?.[goodsId];
+              if (vol) {
+                lastEntry.volume = vol.total;
+                lastEntry.buyVolume = vol.buy;
+                lastEntry.sellVolume = vol.sell;
+              }
+            } else {
+              // 添加新记录
+              const vol = tickVolumes?.[goodsId];
+              history.push({
+                tick: payload.tick,
+                price,
+                volume: vol?.total,
+                buyVolume: vol?.buy,
+                sellVolume: vol?.sell,
+              });
+            }
             
-            // Keep only last 100 entries
-            if (history.length > MAX_HISTORY) {
+            // 使用延迟清理策略：只有超过阈值才触发 slice
+            if (history.length > CLEANUP_THRESHOLD) {
               state.priceHistory.set(goodsId, history.slice(-MAX_HISTORY));
             }
           }

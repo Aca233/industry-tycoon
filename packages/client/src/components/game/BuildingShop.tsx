@@ -6,6 +6,7 @@ import { useState, useMemo } from 'react';
 import { BUILDINGS_BY_CATEGORY, type BuildingData } from '@scc/shared';
 import { useGameStore } from '../../stores/gameStore';
 import { gameWebSocket } from '../../services/websocket';
+import { formatMoney } from '../../utils/formatters';
 
 interface BuildingShopProps {
   onClose: () => void;
@@ -35,18 +36,7 @@ export function BuildingShop({ onClose }: BuildingShopProps) {
   
   const playerCash = useGameStore((state) => state.playerCompany?.cash ?? 0);
   
-  const formatMoney = (cents: number | undefined | null) => {
-    // Handle undefined, null, or NaN values
-    if (cents === undefined || cents === null || !Number.isFinite(cents)) {
-      return '¥0';
-    }
-    if (cents >= 100000000) {
-      return `¥${(cents / 100000000).toFixed(1)}亿`;
-    } else if (cents >= 10000) {
-      return `¥${(cents / 10000).toFixed(0)}万`;
-    }
-    return `¥${cents}`;
-  };
+  // formatMoney 现在从 utils/formatters 导入
   
   const categoryBuildings = useMemo(() => {
     return BUILDINGS_BY_CATEGORY[selectedCategory as keyof typeof BUILDINGS_BY_CATEGORY] ?? [];

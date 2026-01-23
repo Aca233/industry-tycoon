@@ -1,0 +1,642 @@
+/**
+ * 交互式图表组件
+ * 支持折线图和K线图两种模式
+ * 包含缩放、拖拽、悬浮提示等交互功能
+ */
+
+import { useRef, useEffect, useMemo, useState, memo, useCallback } from 'react';
+import type {
+  ChartConfig,
+  ChartDimensions,
+  TooltipData,
+  CandleData,
+} from './types';
+import { DEFAULT_COLORS } from './types';
+import { ChartTooltip } from './ChartTooltip';
+import {
+  setupCanvas,
+  clearCanvas,
+  drawGrid,
+  drawYAxis,
+  drawXAxis,
+  calculateYTicks,
+  calculateXTicks,
+  drawSmoothLine,
+  drawGradientArea,
+  drawCandle,
+  drawVolumeBar,
+  drawCrosshair,
+  drawPriceLabel,
+  calculatePriceRange,
+  downsampleData,
+} from './utils';
+
+/** 图表模式 */
+export type ChartMode = 'line' | 'candle';
+
+/** 时间周期选项 */
+export interface TimeframeOption {
+  label: string;
+  value: number;  // tick数
+}
+
+/** 默认时间周期选项（1 tick = 1小时） */
+export const DEFAULT_TIMEFRAMES: TimeframeOption[] = [
+  { label: '30分', value: 1 },    // 1小时1根K线（最小周期）
+  { label: '1小时', value: 1 },   // 1小时1根K线
+  { label: '3小时', value: 3 },   // 3小时1根K线
+  { label: '6小时', value: 6 },   // 6小时1根K线
+  { label: '12小时', value: 12 }, // 12小时1根K线
+  { label: '1天', value: 24 },    // 1天1根K线
+];
+
+/** 价格数据（折线图用） */
+export interface PriceData {
+  tick: number;
+  price: number;
+  volume?: number;
+  buyVolume?: number;
+  sellVolume?: number;
+}
+
+/** K线数据聚合 */
+function aggregateToCandles(data: PriceData[], period: number): CandleData[] {
+  if (!data || data.length === 0) return [];
+  if (period <= 1) {
+    return data.map(d => ({
+      tick: d.tick,
+      open: d.price,
+      high: d.price,
+      low: d.price,
+      close: d.price,
+      volume: d.volume || 0,
+    }));
+  }
+
+  const candles: CandleData[] = [];
+  let currentCandle: CandleData | null = null;
+
+  for (const point of data) {
+    const periodIndex = Math.floor(point.tick / period);
+    
+    if (!currentCandle || Math.floor(currentCandle.tick / period) !== periodIndex) {
+      if (currentCandle) {
+        candles.push(currentCandle);
+      }
+      currentCandle = {
+        tick: periodIndex * period,
+        open: point.price,
+        high: point.price,
+        low: point.price,
+        close: point.price,
+        volume: point.volume || 0,
+      };
+    } else {
+      currentCandle.high = Math.max(currentCandle.high, point.price);
+      currentCandle.low = Math.min(currentCandle.low, point.price);
+      currentCandle.close = point.price;
+      currentCandle.volume = (currentCandle.volume || 0) + (point.volume || 0);
+    }
+  }
+  
+  if (currentCandle) {
+    candles.push(currentCandle);
+  }
+  
+  return candles;
+}
+
+interface InteractiveChartProps {
+  /** 原始价格数据 */
+  data: PriceData[];
+  /** 宽度 */
+  width?: number;
+  /** 高度 */
+  height?: number;
+  /** 初始模式 */
+  initialMode?: ChartMode;
+  /** 是否显示成交量 */
+  showVolume?: boolean;
+  /** 是否显示均线 */
+  showMA?: boolean;
+  /** 是否显示工具栏 */
+  showToolbar?: boolean;
+  /** 时间周期选项 */
+  timeframes?: TimeframeOption[];
+  /** 初始时间周期 */
+  initialTimeframe?: number;
+  /** 配置 */
+  config?: Partial<ChartConfig>;
+  /** 价格格式化函数 */
+  formatPrice?: (value: number) => string;
+  /** 类名 */
+  className?: string;
+}
+
+export const InteractiveChart = memo(function InteractiveChart({
+  data,
+  width = 600,
+  height = 300,
+  initialMode = 'line',
+  showVolume = true,
+  showMA = true,
+  showToolbar = true,
+  timeframes = DEFAULT_TIMEFRAMES,
+  initialTimeframe = 60,
+  config: configOverride,
+  formatPrice = (v) => `¥${(v / 100).toFixed(2)}`,
+  className = '',
+}: InteractiveChartProps) {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
+  
+  // 状态
+  const [mode, setMode] = useState<ChartMode>(initialMode);
+  const [timeframe, setTimeframe] = useState(initialTimeframe);
+  const [showMAState, setShowMAState] = useState(showMA);
+  const [showVolumeState, setShowVolumeState] = useState(showVolume);
+  const [tooltip, setTooltip] = useState<TooltipData>({
+    x: 0,
+    y: 0,
+    visible: false,
+    data: null,
+  });
+
+  // 合并配置
+  const config: ChartConfig = useMemo(() => ({
+    enableZoom: true,
+    enablePan: true,
+    showCrosshair: true,
+    showGrid: true,
+    minVisibleCandles: 10,
+    maxVisibleCandles: 500,
+    colors: DEFAULT_COLORS,
+    ...configOverride,
+  }), [configOverride]);
+
+  // 工具栏高度
+  const toolbarHeight = showToolbar ? 36 : 0;
+  const volumeHeight = showVolumeState ? 50 : 0;
+
+  // 图表尺寸 - 增加左边距以容纳Y轴标签
+  const dimensions: ChartDimensions = useMemo(() => ({
+    width,
+    height: height - toolbarHeight,
+    margin: { top: 10, right: 55, bottom: 25, left: 50 },
+  }), [width, height, toolbarHeight]);
+
+  // 处理数据
+  const chartData = useMemo(() => {
+    if (!data || data.length === 0) return [];
+    
+    if (mode === 'candle') {
+      // K线模式：聚合数据
+      const candles = aggregateToCandles(data, timeframe);
+      // 限制显示数量
+      const maxCandles = timeframe <= 5 ? 100 : timeframe <= 60 ? 60 : 30;
+      return candles.slice(-maxCandles);
+    } else {
+      // 折线模式：显示所有数据（Canvas 可以轻松处理 1000+ 个点）
+      // 仅在超过 2000 点时才进行轻微下采样
+      if (data.length > 2000) {
+        const targetPoints = Math.max(1500, Math.floor(width));
+        return downsampleData(data, targetPoints);
+      }
+      return data;
+    }
+  }, [data, mode, timeframe, width]);
+
+  // 不使用交互钩子，直接显示所有数据（避免无限循环）
+  const visibleData = chartData;
+  
+  // 简单的十字光标状态 - 使用 ref 避免频繁状态更新
+  const crosshairRef = useRef({ x: 0, y: 0, visible: false });
+  const [, forceUpdate] = useState(0);
+  
+  // 鼠标事件处理 - 使用 useCallback 避免重新创建
+  const handleMouseMove = useCallback((e: React.MouseEvent) => {
+    const rect = e.currentTarget.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    const y = e.clientY - rect.top;
+    
+    const margin = { left: 50, right: 55, top: 10, bottom: 25 };
+    const w = rect.width;
+    const h = rect.height;
+    
+    const visible = x >= margin.left && x <= w - margin.right &&
+                   y >= margin.top && y <= h - margin.bottom;
+    
+    const prev = crosshairRef.current;
+    if (prev.x !== x || prev.y !== y || prev.visible !== visible) {
+      crosshairRef.current = { x, y, visible };
+      // 仅在需要时请求重绘
+      forceUpdate(n => n + 1);
+    }
+  }, []);
+  
+  const handleMouseLeave = useCallback(() => {
+    if (crosshairRef.current.visible) {
+      crosshairRef.current = { ...crosshairRef.current, visible: false };
+      forceUpdate(n => n + 1);
+    }
+  }, []);
+
+  // 计算价格范围 - 确保有足够的范围显示价格变化
+  const priceRange = useMemo(() => {
+    if (visibleData.length === 0) return { min: 0, max: 100 };
+    
+    if (mode === 'candle') {
+      return calculatePriceRange(visibleData as CandleData[], 0.1);
+    } else {
+      const prices = (visibleData as PriceData[]).map(d => d.price);
+      const min = Math.min(...prices);
+      const max = Math.max(...prices);
+      // 确保至少有 2% 的价格范围，避免扁平的图表
+      const range = max - min;
+      const minRange = max * 0.02;  // 最小范围为最高价的 2%
+      const actualRange = Math.max(range, minRange);
+      const padding = actualRange * 0.1;
+      const center = (max + min) / 2;
+      return {
+        min: center - actualRange / 2 - padding,
+        max: center + actualRange / 2 + padding
+      };
+    }
+  }, [visibleData, mode]);
+
+  // 计算Y轴刻度
+  const yTicks = useMemo(() => {
+    const chartHeight = dimensions.height - dimensions.margin.top - dimensions.margin.bottom - volumeHeight;
+    return calculateYTicks(
+      priceRange.min,
+      priceRange.max,
+      chartHeight,
+      dimensions.margin.top,
+      5,
+      formatPrice
+    );
+  }, [priceRange, dimensions, volumeHeight, formatPrice]);
+
+  // 计算X轴刻度
+  const xTicks = useMemo(() => {
+    const chartWidth = dimensions.width - dimensions.margin.left - dimensions.margin.right;
+    return calculateXTicks(
+      visibleData,
+      0,
+      visibleData.length,
+      chartWidth,
+      dimensions.margin.left,
+      6
+    );
+  }, [visibleData, dimensions]);
+
+  // 绘制图表
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas || visibleData.length === 0) return;
+
+    const ctx = setupCanvas(canvas, dimensions.width, dimensions.height);
+    if (!ctx) return;
+
+    // 清除画布
+    clearCanvas(ctx, dimensions.width, dimensions.height);
+
+    const chartWidth = dimensions.width - dimensions.margin.left - dimensions.margin.right;
+    const chartHeight = dimensions.height - dimensions.margin.top - dimensions.margin.bottom - volumeHeight;
+
+    // 绘制网格
+    if (config.showGrid) {
+      drawGrid(ctx, dimensions, yTicks, config.colors.grid);
+    }
+
+    // 绘制Y轴
+    drawYAxis(ctx, dimensions, yTicks, config.colors.text);
+
+    // 绘制X轴
+    drawXAxis(ctx, dimensions, xTicks, config.colors.text);
+
+    // 坐标转换函数
+    const xScale = (i: number) => dimensions.margin.left + (i / (visibleData.length - 1 || 1)) * chartWidth;
+    const yScale = (price: number) => dimensions.margin.top + (1 - (price - priceRange.min) / (priceRange.max - priceRange.min)) * chartHeight;
+
+    if (mode === 'line') {
+      // 绘制折线图
+      const points = (visibleData as PriceData[]).map((d, i) => ({
+        x: xScale(i),
+        y: yScale(d.price),
+      }));
+
+      // 绘制渐变区域
+      drawGradientArea(
+        ctx,
+        points,
+        dimensions.margin.top + chartHeight,
+        config.colors.lineGradientStart,
+        config.colors.lineGradientEnd
+      );
+
+      // 绘制均线
+      if (showMAState && visibleData.length > 5) {
+        const prices = (visibleData as PriceData[]).map(d => d.price);
+        
+        // MA5
+        const ma5Points: { x: number; y: number }[] = [];
+        for (let i = 4; i < prices.length; i++) {
+          const ma = prices.slice(i - 4, i + 1).reduce((a, b) => a + b, 0) / 5;
+          ma5Points.push({ x: xScale(i), y: yScale(ma) });
+        }
+        if (ma5Points.length > 1) {
+          ctx.setLineDash([3, 2]);
+          drawSmoothLine(ctx, ma5Points, '#f59e0b', 1, 0.2);
+          ctx.setLineDash([]);
+        }
+
+        // MA10
+        if (visibleData.length > 10) {
+          const ma10Points: { x: number; y: number }[] = [];
+          for (let i = 9; i < prices.length; i++) {
+            const ma = prices.slice(i - 9, i + 1).reduce((a, b) => a + b, 0) / 10;
+            ma10Points.push({ x: xScale(i), y: yScale(ma) });
+          }
+          if (ma10Points.length > 1) {
+            ctx.setLineDash([3, 2]);
+            drawSmoothLine(ctx, ma10Points, '#ec4899', 1, 0.2);
+            ctx.setLineDash([]);
+          }
+        }
+      }
+
+      // 绘制主曲线
+      drawSmoothLine(ctx, points, config.colors.line, 2, 0.25);
+
+      // 当前价格点
+      if (points.length > 0) {
+        const lastPoint = points[points.length - 1];
+        const lastData = visibleData[visibleData.length - 1] as PriceData;
+        
+        ctx.fillStyle = config.colors.line;
+        ctx.beginPath();
+        ctx.arc(lastPoint.x, lastPoint.y, 4, 0, Math.PI * 2);
+        ctx.fill();
+
+        // 价格标签
+        drawPriceLabel(
+          ctx,
+          lastData.price,
+          lastPoint.y,
+          dimensions.width - dimensions.margin.right + 2,
+          true,
+          config.colors.upCandle,
+          config.colors.downCandle,
+          formatPrice
+        );
+      }
+
+    } else {
+      // 绘制K线图
+      const candleData = visibleData as CandleData[];
+      const candleWidth = Math.max(2, (chartWidth / candleData.length) * 0.7);
+
+      candleData.forEach((d, i) => {
+        const x = xScale(i) - candleWidth / 2;
+        drawCandle(
+          ctx,
+          x,
+          candleWidth,
+          yScale(d.open),
+          yScale(d.high),
+          yScale(d.low),
+          yScale(d.close),
+          config.colors.upCandle,
+          config.colors.downCandle
+        );
+      });
+
+      // 当前价格标签
+      if (candleData.length > 0) {
+        const lastCandle = candleData[candleData.length - 1];
+        const isUp = lastCandle.close >= lastCandle.open;
+        drawPriceLabel(
+          ctx,
+          lastCandle.close,
+          yScale(lastCandle.close),
+          dimensions.width - dimensions.margin.right + 2,
+          isUp,
+          config.colors.upCandle,
+          config.colors.downCandle,
+          formatPrice
+        );
+      }
+    }
+
+    // 绘制成交量
+    if (showVolumeState && volumeHeight > 0) {
+      const volumeY = dimensions.margin.top + chartHeight + 10;
+      
+      // 折线图模式使用 buyVolume + sellVolume，K线模式使用 volume
+      const volumes = visibleData.map(d => {
+        if (mode === 'line') {
+          const pd = d as PriceData;
+          return (pd.buyVolume || 0) + (pd.sellVolume || 0) + (pd.volume || 0);
+        }
+        return d.volume || 0;
+      });
+      const maxVolume = Math.max(...volumes, 1);
+
+      // 绘制成交量标签
+      ctx.fillStyle = '#64748b';
+      ctx.font = '8px sans-serif';
+      ctx.textAlign = 'left';
+      ctx.fillText('VOL', dimensions.margin.left, volumeY + 8);
+
+      visibleData.forEach((d, i) => {
+        const vol = volumes[i];
+        if (vol === 0) return;
+
+        const x = xScale(i);
+        const barWidth = Math.max(2, (chartWidth / visibleData.length) * 0.6);
+        const barHeight = (vol / maxVolume) * (volumeHeight - 15);
+        
+        // 确定涨跌颜色
+        let isUp = true;
+        if (mode === 'candle') {
+          const candle = d as CandleData;
+          isUp = candle.close >= candle.open;
+        } else {
+          const pd = d as PriceData;
+          isUp = (pd.buyVolume || 0) >= (pd.sellVolume || 0);
+        }
+
+        drawVolumeBar(
+          ctx,
+          x - barWidth / 2,
+          volumeY + volumeHeight - barHeight,
+          barWidth,
+          barHeight,
+          isUp,
+          config.colors.upCandle,
+          config.colors.downCandle,
+          0.6
+        );
+      });
+    }
+
+    // 绘制十字光标
+    const crosshair = crosshairRef.current;
+    if (crosshair.visible) {
+      drawCrosshair(ctx, crosshair.x, crosshair.y, dimensions, config.colors.crosshair);
+      
+      // 同步更新悬浮提示（避免单独的 useEffect）
+      const cw = dimensions.width - dimensions.margin.left - dimensions.margin.right;
+      const ratio = (crosshair.x - dimensions.margin.left) / cw;
+      const index = Math.max(0, Math.min(visibleData.length - 1, Math.floor(ratio * visibleData.length)));
+      const dataPoint = visibleData[index];
+      
+      if (dataPoint) {
+        if (mode === 'candle') {
+          const candle = dataPoint as CandleData;
+          setTooltip({
+            x: crosshair.x,
+            y: crosshair.y,
+            visible: true,
+            data: {
+              tick: candle.tick,
+              open: candle.open,
+              high: candle.high,
+              low: candle.low,
+              close: candle.close,
+              volume: candle.volume,
+              change: candle.close - candle.open,
+              changePercent: ((candle.close - candle.open) / candle.open) * 100,
+            },
+          });
+        } else {
+          const price = dataPoint as PriceData;
+          setTooltip({
+            x: crosshair.x,
+            y: crosshair.y,
+            visible: true,
+            data: {
+              tick: price.tick,
+              price: price.price,
+              volume: price.volume,
+            },
+          });
+        }
+      }
+    } else {
+      setTooltip(prev => prev.visible ? { ...prev, visible: false } : prev);
+    }
+
+  }, [visibleData, mode, dimensions, config, priceRange, yTicks, xTicks, showMAState, showVolumeState, volumeHeight, formatPrice]);
+
+  // 空数据提示
+  if (!data || data.length === 0) {
+    return (
+      <div 
+        className={`flex items-center justify-center bg-slate-800/50 rounded-lg ${className}`}
+        style={{ width, height }}
+      >
+        <span className="text-slate-500 text-sm">暂无数据</span>
+      </div>
+    );
+  }
+
+  return (
+    <div className={`bg-slate-900/50 rounded-lg ${className}`} ref={containerRef}>
+      {/* 工具栏 */}
+      {showToolbar && (
+        <div className="flex items-center gap-1 px-2 py-1 border-b border-slate-700/50">
+          {/* 模式切换 */}
+          <button
+            onClick={() => setMode(mode === 'line' ? 'candle' : 'line')}
+            className={`px-2 py-0.5 text-xs rounded transition-colors ${
+              mode === 'candle'
+                ? 'bg-orange-600 text-white'
+                : 'bg-slate-700/50 text-slate-400 hover:bg-slate-600/50'
+            }`}
+          >
+            {mode === 'line' ? '📈' : '📊'}
+          </button>
+
+          {/* 均线 */}
+          <button
+            onClick={() => setShowMAState(!showMAState)}
+            className={`px-2 py-0.5 text-xs rounded transition-colors ${
+              showMAState
+                ? 'bg-purple-600 text-white'
+                : 'bg-slate-700/50 text-slate-400 hover:bg-slate-600/50'
+            }`}
+          >
+            MA
+          </button>
+
+          {/* 成交量 */}
+          <button
+            onClick={() => setShowVolumeState(!showVolumeState)}
+            className={`px-2 py-0.5 text-xs rounded transition-colors ${
+              showVolumeState
+                ? 'bg-cyan-600 text-white'
+                : 'bg-slate-700/50 text-slate-400 hover:bg-slate-600/50'
+            }`}
+          >
+            VOL
+          </button>
+
+          <div className="w-px h-4 bg-slate-600 mx-1" />
+
+          {/* 时间周期 */}
+          {mode === 'candle' && timeframes.map(tf => (
+            <button
+              key={tf.value}
+              onClick={() => setTimeframe(tf.value)}
+              className={`px-2 py-0.5 text-xs rounded transition-colors ${
+                timeframe === tf.value
+                  ? 'bg-blue-600 text-white'
+                  : 'bg-slate-700/50 text-slate-400 hover:bg-slate-600/50'
+              }`}
+            >
+              {tf.label}
+            </button>
+          ))}
+
+          <div className="flex-1" />
+
+          {/* 数据信息 */}
+          <span className="text-xs text-slate-500">
+            {visibleData.length}/{chartData.length}
+          </span>
+        </div>
+      )}
+
+      {/* 图例 */}
+      {showMAState && mode === 'line' && (
+        <div className="absolute top-8 left-2 flex gap-2 text-[9px] z-10">
+          <span className="text-orange-400">— MA5</span>
+          <span className="text-pink-400">— MA10</span>
+        </div>
+      )}
+
+      {/* Canvas */}
+      <div className="relative p-1">
+        <canvas
+          ref={canvasRef}
+          style={{ width: dimensions.width, height: dimensions.height }}
+          className="block cursor-crosshair"
+          onMouseMove={handleMouseMove}
+          onMouseLeave={handleMouseLeave}
+        />
+
+        {/* 悬浮提示 */}
+        <ChartTooltip
+          data={tooltip}
+          colors={config.colors.tooltip}
+          formatPrice={formatPrice}
+          showVolume={showVolumeState}
+        />
+      </div>
+    </div>
+  );
+});
+
+export default InteractiveChart;

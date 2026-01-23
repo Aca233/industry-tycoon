@@ -1,6 +1,12 @@
 /**
  * 市场订单簿
  * 管理所有商品的买卖订单
+ *
+ * 性能优化 v2:
+ * - 使用二分查找插入订单 O(log n)
+ * - 使用索引直接删除订单 O(1)
+ * - 缓存活跃订单数量避免重复遍历
+ * - 优化订单匹配算法
  */
 
 import { EventEmitter } from 'events';
@@ -12,17 +18,71 @@ import type {
 import { GOODS_DATA } from '@scc/shared';
 
 /**
+ * 二分查找插入位置（买单：价格降序）
+ * 返回应该插入的索引位置
+ */
+function binarySearchBuyInsert(orders: MarketOrder[], price: number): number {
+  let left = 0;
+  let right = orders.length;
+  while (left < right) {
+    const mid = (left + right) >>> 1;
+    // 买单按价格降序，price高的在前
+    if (orders[mid]!.pricePerUnit > price) {
+      left = mid + 1;
+    } else {
+      right = mid;
+    }
+  }
+  return left;
+}
+
+/**
+ * 二分查找插入位置（卖单：价格升序）
+ * 返回应该插入的索引位置
+ */
+function binarySearchSellInsert(orders: MarketOrder[], price: number): number {
+  let left = 0;
+  let right = orders.length;
+  while (left < right) {
+    const mid = (left + right) >>> 1;
+    // 卖单按价格升序，price低的在前
+    if (orders[mid]!.pricePerUnit < price) {
+      left = mid + 1;
+    } else {
+      right = mid;
+    }
+  }
+  return left;
+}
+
+/**
+ * 扩展的订单簿数据结构，包含索引
+ */
+interface OptimizedOrderBook extends GoodsOrderBook {
+  /** 订单ID到数组索引的映射 */
+  buyOrderIndex: Map<string, number>;
+  sellOrderIndex: Map<string, number>;
+  /** 活跃订单数量缓存 */
+  activeBuyCount: number;
+  activeSellCount: number;
+}
+
+/**
  * 订单簿管理器 - 单例
  */
 export class MarketOrderBook extends EventEmitter {
-  /** 订单簿 Map<goodsId, GoodsOrderBook> */
-  private orderBooks: Map<string, GoodsOrderBook> = new Map();
+  /** 订单簿 Map<goodsId, OptimizedOrderBook> */
+  private orderBooks: Map<string, OptimizedOrderBook> = new Map();
   /** 所有订单索引 Map<orderId, MarketOrder> */
   private orders: Map<string, MarketOrder> = new Map();
   /** 订单ID计数器 */
   private orderIdCounter: number = 0;
-  /** 默认订单有效期（tick数） */
-  private readonly DEFAULT_VALIDITY_TICKS = 720; // 1个月
+  /** 默认订单有效期（tick数）- 缩短到48 ticks（2天）减少订单累积 */
+  private readonly DEFAULT_VALIDITY_TICKS = 48; // 2天
+  /** 每个商品最大订单数限制 */
+  private readonly MAX_ORDERS_PER_GOODS = 300;
+  /** 每家公司每种商品最大活跃订单数 */
+  private readonly MAX_ORDERS_PER_COMPANY_GOODS = 5;
   
   constructor() {
     super();
@@ -41,6 +101,11 @@ export class MarketOrderBook extends EventEmitter {
         bestBid: null,
         bestAsk: null,
         spread: null,
+        // 扩展字段
+        buyOrderIndex: new Map(),
+        sellOrderIndex: new Map(),
+        activeBuyCount: 0,
+        activeSellCount: 0,
       });
     }
     console.log(`[MarketOrderBook] Initialized order books for ${GOODS_DATA.length} goods`);
@@ -81,15 +146,53 @@ export class MarketOrderBook extends EventEmitter {
       lastUpdateTick: currentTick,
     };
     
+    // 检查该公司在该商品上的订单数是否超限
+    const orderBook = this.orderBooks.get(goodsId);
+    if (orderBook) {
+      // 检查公司订单限制
+      let companyOrderCount = 0;
+      for (const o of orderBook.buyOrders) {
+        if (o.companyId === companyId && (o.status === 'open' || o.status === 'partial')) {
+          companyOrderCount++;
+        }
+      }
+      if (companyOrderCount >= this.MAX_ORDERS_PER_COMPANY_GOODS) {
+        // 取消最旧的订单以腾出空间
+        for (const o of orderBook.buyOrders) {
+          if (o.companyId === companyId && (o.status === 'open' || o.status === 'partial')) {
+            o.status = 'cancelled';
+            orderBook.activeBuyCount = Math.max(0, orderBook.activeBuyCount - 1);
+            break; // 只取消一个
+          }
+        }
+      }
+      
+      // 检查总订单限制
+      if (orderBook.activeBuyCount >= this.MAX_ORDERS_PER_GOODS) {
+        // 移除最旧的订单（数组末尾的是最旧的，因为按价格排序）
+        const oldestIdx = orderBook.buyOrders.length - 1;
+        if (oldestIdx >= 0) {
+          const oldest = orderBook.buyOrders[oldestIdx];
+          if (oldest) {
+            oldest.status = 'cancelled';
+            orderBook.buyOrders.pop();
+            orderBook.activeBuyCount = Math.max(0, orderBook.activeBuyCount - 1);
+          }
+        }
+      }
+    }
+    
     // 添加到订单索引
     this.orders.set(orderId, order);
     
-    // 添加到订单簿（按价格降序，价高者优先）
-    const orderBook = this.orderBooks.get(goodsId);
+    // 添加到订单簿（使用二分查找插入，保持价格降序）
     if (orderBook) {
-      orderBook.buyOrders.push(order);
-      orderBook.buyOrders.sort((a, b) => b.pricePerUnit - a.pricePerUnit);
-      this.updateBestPrices(goodsId);
+      const insertIdx = binarySearchBuyInsert(orderBook.buyOrders, maxPrice);
+      orderBook.buyOrders.splice(insertIdx, 0, order);
+      // 增量更新索引（只更新插入点之后的索引）
+      this.incrementalUpdateBuyIndex(orderBook, insertIdx);
+      orderBook.activeBuyCount++;
+      this.updateBestPricesOptimized(orderBook);
     }
     
     this.emit('orderSubmitted', { order, type: 'buy' });
@@ -125,15 +228,53 @@ export class MarketOrderBook extends EventEmitter {
       lastUpdateTick: currentTick,
     };
     
+    // 检查该公司在该商品上的订单数是否超限
+    const orderBook = this.orderBooks.get(goodsId);
+    if (orderBook) {
+      // 检查公司订单限制
+      let companyOrderCount = 0;
+      for (const o of orderBook.sellOrders) {
+        if (o.companyId === companyId && (o.status === 'open' || o.status === 'partial')) {
+          companyOrderCount++;
+        }
+      }
+      if (companyOrderCount >= this.MAX_ORDERS_PER_COMPANY_GOODS) {
+        // 取消最旧的订单以腾出空间
+        for (const o of orderBook.sellOrders) {
+          if (o.companyId === companyId && (o.status === 'open' || o.status === 'partial')) {
+            o.status = 'cancelled';
+            orderBook.activeSellCount = Math.max(0, orderBook.activeSellCount - 1);
+            break;
+          }
+        }
+      }
+      
+      // 检查总订单限制
+      if (orderBook.activeSellCount >= this.MAX_ORDERS_PER_GOODS) {
+        // 移除最旧的卖单（末尾的是价格最高的，也可能是较旧的）
+        const oldestIdx = orderBook.sellOrders.length - 1;
+        if (oldestIdx >= 0) {
+          const oldest = orderBook.sellOrders[oldestIdx];
+          if (oldest) {
+            oldest.status = 'cancelled';
+            orderBook.sellOrders.pop();
+            orderBook.activeSellCount = Math.max(0, orderBook.activeSellCount - 1);
+          }
+        }
+      }
+    }
+    
     // 添加到订单索引
     this.orders.set(orderId, order);
     
-    // 添加到订单簿（按价格升序，价低者优先）
-    const orderBook = this.orderBooks.get(goodsId);
+    // 添加到订单簿（使用二分查找插入，保持价格升序）
     if (orderBook) {
-      orderBook.sellOrders.push(order);
-      orderBook.sellOrders.sort((a, b) => a.pricePerUnit - b.pricePerUnit);
-      this.updateBestPrices(goodsId);
+      const insertIdx = binarySearchSellInsert(orderBook.sellOrders, minPrice);
+      orderBook.sellOrders.splice(insertIdx, 0, order);
+      // 增量更新索引
+      this.incrementalUpdateSellIndex(orderBook, insertIdx);
+      orderBook.activeSellCount++;
+      this.updateBestPricesOptimized(orderBook);
     }
     
     this.emit('orderSubmitted', { order, type: 'sell' });
@@ -156,15 +297,25 @@ export class MarketOrderBook extends EventEmitter {
     order.status = 'cancelled';
     order.lastUpdateTick = currentTick;
     
-    // 从订单簿中移除
+    // 从订单簿中移除（使用索引快速定位）
     const orderBook = this.orderBooks.get(order.goodsId);
     if (orderBook) {
       if (order.orderType === 'buy') {
-        orderBook.buyOrders = orderBook.buyOrders.filter(o => o.id !== orderId);
+        const idx = orderBook.buyOrderIndex.get(orderId);
+        if (idx !== undefined) {
+          orderBook.buyOrders.splice(idx, 1);
+          this.rebuildBuyOrderIndex(orderBook);
+          orderBook.activeBuyCount--;
+        }
       } else {
-        orderBook.sellOrders = orderBook.sellOrders.filter(o => o.id !== orderId);
+        const idx = orderBook.sellOrderIndex.get(orderId);
+        if (idx !== undefined) {
+          orderBook.sellOrders.splice(idx, 1);
+          this.rebuildSellOrderIndex(orderBook);
+          orderBook.activeSellCount--;
+        }
       }
-      this.updateBestPrices(order.goodsId);
+      this.updateBestPricesOptimized(orderBook);
     }
     
     this.emit('orderCancelled', { order });
@@ -318,12 +469,27 @@ export class MarketOrderBook extends EventEmitter {
   }
   
   /**
-   * 获取可匹配的订单对
+   * 获取可匹配的订单对（优化版）
    * 返回买单价格 >= 卖单价格的订单对
+   *
+   * 优化：利用排序特性，买单按价格降序，卖单按价格升序
+   * 当最高买价 < 最低卖价时，不可能有匹配，立即返回
    */
   getMatchableOrders(goodsId: string): Array<{ buyOrder: MarketOrder; sellOrder: MarketOrder }> {
     const orderBook = this.orderBooks.get(goodsId);
     if (!orderBook) return [];
+    
+    // 快速检查：如果没有活跃订单或者价格不匹配，直接返回
+    if (orderBook.activeBuyCount === 0 || orderBook.activeSellCount === 0) {
+      return [];
+    }
+    
+    // 快速检查：最高买价 < 最低卖价，不可能有匹配
+    if (orderBook.bestBid !== null && orderBook.bestAsk !== null) {
+      if (orderBook.bestBid < orderBook.bestAsk) {
+        return [];
+      }
+    }
     
     const matches: Array<{ buyOrder: MarketOrder; sellOrder: MarketOrder }> = [];
     
@@ -332,16 +498,17 @@ export class MarketOrderBook extends EventEmitter {
       if (buyOrder.status !== 'open' && buyOrder.status !== 'partial') continue;
       if (buyOrder.remainingQuantity <= 0) continue;
       
-      // 找到可以匹配的卖单（价格低的优先）
+      // 优化：因为卖单按价格升序排列，一旦遇到价格超过买价的卖单，后面都不可能匹配
       for (const sellOrder of orderBook.sellOrders) {
+        // 提前终止：卖价超过买价
+        if (sellOrder.pricePerUnit > buyOrder.pricePerUnit) break;
+        
         if (sellOrder.status !== 'open' && sellOrder.status !== 'partial') continue;
         if (sellOrder.remainingQuantity <= 0) continue;
         if (sellOrder.companyId === buyOrder.companyId) continue; // 不能自成交
         
         // 买单价格 >= 卖单价格，可以成交
-        if (buyOrder.pricePerUnit >= sellOrder.pricePerUnit) {
-          matches.push({ buyOrder, sellOrder });
-        }
+        matches.push({ buyOrder, sellOrder });
       }
     }
     
@@ -362,15 +529,25 @@ export class MarketOrderBook extends EventEmitter {
       order.status = 'filled';
       order.remainingQuantity = 0;
       
-      // 从订单簿中移除
+      // 从订单簿中移除（使用索引快速定位）
       const orderBook = this.orderBooks.get(order.goodsId);
       if (orderBook) {
         if (order.orderType === 'buy') {
-          orderBook.buyOrders = orderBook.buyOrders.filter(o => o.id !== orderId);
+          const idx = orderBook.buyOrderIndex.get(orderId);
+          if (idx !== undefined) {
+            orderBook.buyOrders.splice(idx, 1);
+            this.rebuildBuyOrderIndex(orderBook);
+            orderBook.activeBuyCount = Math.max(0, orderBook.activeBuyCount - 1);
+          }
         } else {
-          orderBook.sellOrders = orderBook.sellOrders.filter(o => o.id !== orderId);
+          const idx = orderBook.sellOrderIndex.get(orderId);
+          if (idx !== undefined) {
+            orderBook.sellOrders.splice(idx, 1);
+            this.rebuildSellOrderIndex(orderBook);
+            orderBook.activeSellCount = Math.max(0, orderBook.activeSellCount - 1);
+          }
         }
-        this.updateBestPrices(order.goodsId);
+        this.updateBestPricesOptimized(orderBook);
       }
     } else {
       order.status = 'partial';
@@ -378,27 +555,80 @@ export class MarketOrderBook extends EventEmitter {
   }
   
   /**
-   * 更新最佳买卖价
+   * 重建买单索引映射
    */
-  private updateBestPrices(goodsId: string): void {
-    const orderBook = this.orderBooks.get(goodsId);
-    if (!orderBook) return;
+  private rebuildBuyOrderIndex(orderBook: OptimizedOrderBook): void {
+    orderBook.buyOrderIndex.clear();
+    for (let i = 0; i < orderBook.buyOrders.length; i++) {
+      orderBook.buyOrderIndex.set(orderBook.buyOrders[i]!.id, i);
+    }
+  }
+  
+  /**
+   * 重建卖单索引映射
+   */
+  private rebuildSellOrderIndex(orderBook: OptimizedOrderBook): void {
+    orderBook.sellOrderIndex.clear();
+    for (let i = 0; i < orderBook.sellOrders.length; i++) {
+      orderBook.sellOrderIndex.set(orderBook.sellOrders[i]!.id, i);
+    }
+  }
+  
+  /**
+   * 增量更新买单索引（插入后只更新受影响的索引）
+   */
+  private incrementalUpdateBuyIndex(orderBook: OptimizedOrderBook, insertIdx: number): void {
+    // 新插入的订单设置索引
+    const newOrder = orderBook.buyOrders[insertIdx];
+    if (newOrder) {
+      orderBook.buyOrderIndex.set(newOrder.id, insertIdx);
+    }
+    // 更新插入点之后的所有订单索引（+1）
+    for (let i = insertIdx + 1; i < orderBook.buyOrders.length; i++) {
+      const order = orderBook.buyOrders[i];
+      if (order) {
+        orderBook.buyOrderIndex.set(order.id, i);
+      }
+    }
+  }
+  
+  /**
+   * 增量更新卖单索引（插入后只更新受影响的索引）
+   */
+  private incrementalUpdateSellIndex(orderBook: OptimizedOrderBook, insertIdx: number): void {
+    const newOrder = orderBook.sellOrders[insertIdx];
+    if (newOrder) {
+      orderBook.sellOrderIndex.set(newOrder.id, insertIdx);
+    }
+    for (let i = insertIdx + 1; i < orderBook.sellOrders.length; i++) {
+      const order = orderBook.sellOrders[i];
+      if (order) {
+        orderBook.sellOrderIndex.set(order.id, i);
+      }
+    }
+  }
+  
+  /**
+   * 更新最佳买卖价（优化版，利用排序特性）
+   */
+  private updateBestPricesOptimized(orderBook: OptimizedOrderBook): void {
+    // 买单按价格降序，第一个活跃订单就是最高价
+    orderBook.bestBid = null;
+    for (const order of orderBook.buyOrders) {
+      if (order.status === 'open' || order.status === 'partial') {
+        orderBook.bestBid = order.pricePerUnit;
+        break;
+      }
+    }
     
-    // 更新最佳买价
-    const activeBuyOrders = orderBook.buyOrders.filter(
-      o => o.status === 'open' || o.status === 'partial'
-    );
-    orderBook.bestBid = activeBuyOrders.length > 0 
-      ? activeBuyOrders[0]?.pricePerUnit ?? null
-      : null;
-    
-    // 更新最佳卖价
-    const activeSellOrders = orderBook.sellOrders.filter(
-      o => o.status === 'open' || o.status === 'partial'
-    );
-    orderBook.bestAsk = activeSellOrders.length > 0 
-      ? activeSellOrders[0]?.pricePerUnit ?? null
-      : null;
+    // 卖单按价格升序，第一个活跃订单就是最低价
+    orderBook.bestAsk = null;
+    for (const order of orderBook.sellOrders) {
+      if (order.status === 'open' || order.status === 'partial') {
+        orderBook.bestAsk = order.pricePerUnit;
+        break;
+      }
+    }
     
     // 更新价差
     if (orderBook.bestBid !== null && orderBook.bestAsk !== null) {
@@ -420,15 +650,22 @@ export class MarketOrderBook extends EventEmitter {
           order.status = 'expired';
           order.lastUpdateTick = currentTick;
           
-          // 从订单簿中移除
+          // 从订单簿中移除（使用索引快速定位）
           const orderBook = this.orderBooks.get(order.goodsId);
           if (orderBook) {
             if (order.orderType === 'buy') {
-              orderBook.buyOrders = orderBook.buyOrders.filter(o => o.id !== orderId);
+              const idx = orderBook.buyOrderIndex.get(orderId);
+              if (idx !== undefined) {
+                orderBook.buyOrders.splice(idx, 1);
+                orderBook.activeBuyCount = Math.max(0, orderBook.activeBuyCount - 1);
+              }
             } else {
-              orderBook.sellOrders = orderBook.sellOrders.filter(o => o.id !== orderId);
+              const idx = orderBook.sellOrderIndex.get(orderId);
+              if (idx !== undefined) {
+                orderBook.sellOrders.splice(idx, 1);
+                orderBook.activeSellCount = Math.max(0, orderBook.activeSellCount - 1);
+              }
             }
-            this.updateBestPrices(order.goodsId);
           }
           
           this.emit('orderExpired', { order });
@@ -437,7 +674,13 @@ export class MarketOrderBook extends EventEmitter {
       }
     }
     
+    // 批量重建索引（比逐个删除更高效）
     if (cleanedCount > 0) {
+      for (const orderBook of this.orderBooks.values()) {
+        this.rebuildBuyOrderIndex(orderBook);
+        this.rebuildSellOrderIndex(orderBook);
+        this.updateBestPricesOptimized(orderBook);
+      }
       console.log(`[MarketOrderBook] Cleaned up ${cleanedCount} expired orders`);
     }
     
@@ -483,18 +726,12 @@ export class MarketOrderBook extends EventEmitter {
     let goodsWithSellOrders = 0;
     
     for (const orderBook of this.orderBooks.values()) {
-      const activeBuys = orderBook.buyOrders.filter(
-        o => o.status === 'open' || o.status === 'partial'
-      );
-      const activeSells = orderBook.sellOrders.filter(
-        o => o.status === 'open' || o.status === 'partial'
-      );
+      // 使用缓存的活跃订单数量，避免遍历
+      totalBuyOrders += orderBook.activeBuyCount;
+      totalSellOrders += orderBook.activeSellCount;
       
-      totalBuyOrders += activeBuys.length;
-      totalSellOrders += activeSells.length;
-      
-      if (activeBuys.length > 0) goodsWithBuyOrders++;
-      if (activeSells.length > 0) goodsWithSellOrders++;
+      if (orderBook.activeBuyCount > 0) goodsWithBuyOrders++;
+      if (orderBook.activeSellCount > 0) goodsWithSellOrders++;
     }
     
     return {

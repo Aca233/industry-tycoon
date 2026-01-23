@@ -20,9 +20,11 @@ import {
   NEED_GROUPS,
   getGoodsForNeedGroupSorted,
   GOODS_DATA,
+  CompanyType,
 } from '@scc/shared';
 import { priceDiscoveryService } from './priceDiscovery.js';
 import { marketOrderBook } from './marketOrderBook.js';
+import { inventoryManager } from './inventoryManager.js';
 
 /**
  * POPs消费服务配置
@@ -69,13 +71,29 @@ export class POPsConsumptionManager extends EventEmitter {
   initialize(): void {
     if (this.initialized) return;
     
-    // 初始化每个POPGroup的满足度
+    // 初始化每个POPGroup的满足度和虚拟消费者公司
     for (const popGroup of POP_GROUPS) {
       const needSatisfaction: Record<string, number> = {};
       for (const needGroup of NEED_GROUPS) {
         needSatisfaction[needGroup.id] = 50; // 初始满足度50%
       }
       this.satisfaction.set(popGroup.id, needSatisfaction);
+      
+      // 为每个POPGroup初始化虚拟消费者公司
+      // 初始现金 = 日均收入 * 7（一周的储蓄）
+      const consumerId = `pop-${popGroup.id}`;
+      const dailyIncome = (popGroup.population * popGroup.monthlyIncome) / 30;
+      const initialCash = dailyIncome * 7;
+      
+      inventoryManager.initializeCompany(
+        consumerId,
+        `消费者-${popGroup.nameZh}`,
+        CompanyType.NPC,
+        initialCash,
+        0
+      );
+      
+      console.log(`[POPsConsumption] 初始化消费者: ${consumerId}, 初始资金: ¥${(initialCash / 10000).toFixed(2)}万`);
     }
     
     this.initialized = true;
@@ -97,6 +115,9 @@ export class POPsConsumptionManager extends EventEmitter {
     
     this.lastProcessTick = currentTick;
     
+    // 每天补充消费者现金（模拟工资收入）
+    this.replenishConsumerCash(currentTick);
+    
     // 衰减满足度
     this.decaySatisfaction();
     
@@ -112,6 +133,19 @@ export class POPsConsumptionManager extends EventEmitter {
     this.submitOrders(allDecisions, currentTick);
     
     return allDecisions;
+  }
+  
+  /**
+   * 补充消费者现金（每天发工资）
+   */
+  private replenishConsumerCash(currentTick: number): void {
+    for (const popGroup of POP_GROUPS) {
+      const consumerId = `pop-${popGroup.id}`;
+      const dailyIncome = (popGroup.population * popGroup.monthlyIncome) / 30;
+      
+      // 添加每日收入
+      inventoryManager.addCash(consumerId, dailyIncome, currentTick, 'daily_income');
+    }
   }
   
   /**

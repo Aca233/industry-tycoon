@@ -3,6 +3,7 @@
  */
 
 import { useGameStore, useFinancials, type BuildingProfit } from '../../stores';
+import { formatMoneyShort } from '../../utils/formatters';
 
 interface FinancialReportProps {
   onClose: () => void;
@@ -12,32 +13,7 @@ export function FinancialReport({ onClose }: FinancialReportProps) {
   const financials = useFinancials();
   const buildings = useGameStore((state) => state.buildings);
 
-  const formatMoney = (cents: number | undefined | null) => {
-    // Handle undefined, null, or NaN values
-    if (cents === undefined || cents === null || !Number.isFinite(cents)) {
-      return '¥0';
-    }
-    return new Intl.NumberFormat('zh-CN', {
-      style: 'currency',
-      currency: 'CNY',
-      minimumFractionDigits: 2,
-      maximumFractionDigits: 2,
-    }).format(cents / 100);
-  };
-
-  const formatMoneyShort = (cents: number | undefined | null) => {
-    // Handle undefined, null, or NaN values
-    if (cents === undefined || cents === null || !Number.isFinite(cents)) {
-      return '¥0';
-    }
-    const value = cents / 100;
-    if (Math.abs(value) >= 1000000) {
-      return `¥${(value / 1000000).toFixed(2)}M`;
-    } else if (Math.abs(value) >= 1000) {
-      return `¥${(value / 1000).toFixed(2)}K`;
-    }
-    return formatMoney(cents);
-  };
+  // formatMoney 和 formatMoneyShort 现在从 utils/formatters 导入
 
   return (
     <div className="fixed inset-0 bg-black/70 z-50 flex items-center justify-center p-4">
