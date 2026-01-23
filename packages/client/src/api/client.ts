@@ -2,8 +2,8 @@
  * API Client for communicating with the backend
  */
 
-const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:3001';
-const WS_BASE_URL = import.meta.env.VITE_WS_URL || 'ws://localhost:3001';
+const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:3002';
+const WS_BASE_URL = import.meta.env.VITE_WS_URL || 'ws://localhost:3002';
 
 interface ApiResponse<T> {
   data: T;
