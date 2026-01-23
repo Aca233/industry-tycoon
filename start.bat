@@ -1,75 +1,74 @@
 @echo off
-chcp 65001 >nul
-title Supply Chain Commander - 供应链指挥官
+chcp 65001 >nul 2>&1
+title Supply Chain Commander
 setlocal enabledelayedexpansion
 
 echo.
-echo ╔══════════════════════════════════════════════════════════════╗
-echo ║       Supply Chain Commander - 供应链指挥官                ║
-echo ║       Victoria 3 Style Business Simulation                  ║
-echo ╚══════════════════════════════════════════════════════════════╝
+echo ========================================
+echo   Supply Chain Commander
+echo   Victoria 3 Style Business Simulation
+echo ========================================
 echo.
 
 :: ========================================
 :: Step 1: Check Node.js
 :: ========================================
-echo [1/6] 检查 Node.js...
+echo [1/6] Checking Node.js...
 where node >nul 2>&1
 if errorlevel 1 (
     echo.
-    echo [错误] 未检测到 Node.js！
+    echo [ERROR] Node.js not found!
     echo.
-    echo 请先安装 Node.js v20 或更高版本:
-    echo   下载地址: https://nodejs.org/
-    echo   推荐安装 LTS (长期支持版本)
+    echo Please install Node.js v20 or higher:
+    echo   Download: https://nodejs.org/
+    echo   Recommended: LTS version
     echo.
-    echo 安装完成后，请重新运行此脚本。
+    echo After installation, run this script again.
     echo.
     pause
     exit /b 1
 )
 
-:: Check Node.js version (need v20+)
 for /f "tokens=1" %%a in ('node -v') do set NODE_VERSION=%%a
-echo       Node.js 版本: %NODE_VERSION%
+echo       Node.js version: %NODE_VERSION%
 
 :: ========================================
 :: Step 2: Check/Install pnpm
 :: ========================================
-echo [2/6] 检查 pnpm...
+echo [2/6] Checking pnpm...
 where pnpm >nul 2>&1
 if errorlevel 1 (
-    echo       pnpm 未安装，正在安装...
+    echo       pnpm not found, installing...
     call npm install -g pnpm@latest
     if errorlevel 1 (
-        echo [错误] pnpm 安装失败！
+        echo [ERROR] Failed to install pnpm!
         pause
         exit /b 1
     )
-    echo       pnpm 安装完成！
+    echo       pnpm installed!
 ) else (
     for /f "tokens=1" %%a in ('pnpm -v') do set PNPM_VERSION=%%a
-    echo       pnpm 版本: !PNPM_VERSION!
+    echo       pnpm version: !PNPM_VERSION!
 )
 
 :: ========================================
 :: Step 3: Create .env file if not exists
 :: ========================================
-echo [3/6] 检查配置文件...
+echo [3/6] Checking config files...
 if not exist "packages\server\.env" (
     if exist "packages\server\.env.example" (
-        echo       创建 .env 配置文件...
+        echo       Creating .env config file...
         copy "packages\server\.env.example" "packages\server\.env" >nul
-        echo       配置文件已创建！
+        echo       Config file created!
         echo.
-        echo ╔══════════════════════════════════════════════════════════════╗
-        echo ║  提示: LLM API 可以在游戏内设置                              ║
-        echo ║  启动后点击左侧 ⚙️ 设置按钮配置 OpenAI/Gemini API             ║
-        echo ╚══════════════════════════════════════════════════════════════╝
+        echo ========================================
+        echo   NOTE: LLM API can be configured in-game
+        echo   Click Settings button after startup
+        echo ========================================
         echo.
     )
 ) else (
-    echo       配置文件已存在
+    echo       Config file exists
 )
 
 :: Create data directory if not exists
@@ -80,103 +79,103 @@ if not exist "packages\server\data" (
 :: ========================================
 :: Step 4: Install dependencies
 :: ========================================
-echo [4/6] 检查依赖...
+echo [4/6] Checking dependencies...
 if not exist "node_modules" (
-    echo       首次运行，正在安装依赖（可能需要几分钟）...
+    echo       First run, installing dependencies...
+    echo       This may take a few minutes...
     call pnpm install
     if errorlevel 1 (
-        echo [错误] 依赖安装失败！
+        echo [ERROR] Failed to install dependencies!
         pause
         exit /b 1
     )
-    echo       依赖安装完成！
+    echo       Dependencies installed!
 ) else (
-    echo       依赖已安装
+    echo       Dependencies already installed
 )
 
 :: ========================================
 :: Step 5: Build shared packages
 :: ========================================
-echo [5/6] 检查编译状态...
+echo [5/6] Checking build status...
 set NEED_BUILD=0
 
 if not exist "packages\shared\dist" set NEED_BUILD=1
 if not exist "packages\game-core\dist" set NEED_BUILD=1
 
 if %NEED_BUILD%==1 (
-    echo       正在编译项目（首次运行需要较长时间）...
+    echo       Building project...
     
-    :: Build shared package
     if not exist "packages\shared\dist" (
-        echo       - 编译 shared 模块...
+        echo       - Building shared module...
         call pnpm --filter @scc/shared build
         if errorlevel 1 (
-            echo [错误] shared 模块编译失败！
+            echo [ERROR] Failed to build shared module!
             pause
             exit /b 1
         )
     )
     
-    :: Build game-core package
     if not exist "packages\game-core\dist" (
-        echo       - 编译 game-core 模块...
+        echo       - Building game-core module...
         call pnpm --filter @scc/game-core build
         if errorlevel 1 (
-            echo [错误] game-core 模块编译失败！
+            echo [ERROR] Failed to build game-core module!
             pause
             exit /b 1
         )
     )
     
-    echo       编译完成！
+    echo       Build completed!
 ) else (
-    echo       项目已编译
+    echo       Project already built
 )
 
 :: ========================================
 :: Step 6: Start services
 :: ========================================
-echo [6/6] 启动游戏服务...
+echo [6/6] Starting game services...
 echo.
-echo ╔══════════════════════════════════════════════════════════════╗
-echo ║  服务器地址: http://localhost:3002                          ║
-echo ║  游戏地址:   http://localhost:5173                          ║
-echo ║                                                              ║
-echo ║  按 Ctrl+C 可以停止服务                                      ║
-echo ╚══════════════════════════════════════════════════════════════╝
+echo ========================================
+echo   Server: http://localhost:3002
+echo   Client: http://localhost:5173
+echo.
+echo   Press Ctrl+C to stop services
+echo ========================================
 echo.
 
 :: Start server in new window
 start "SCC Server" cmd /k "cd packages\server && pnpm dev"
 
 :: Wait for server to initialize
-echo 正在启动服务器...
+echo Starting server...
 timeout /t 3 >nul
 
 :: Start client in new window
 start "SCC Client" cmd /k "cd packages\client && pnpm dev"
 
 :: Wait for client to start
-echo 正在启动客户端...
+echo Starting client...
 timeout /t 4 >nul
 
 :: Open browser
-echo 正在打开浏览器...
+echo Opening browser...
 start http://localhost:5173
 
 echo.
-echo ╔══════════════════════════════════════════════════════════════╗
-echo ║  ✓ 游戏已启动！                                              ║
-echo ║                                                              ║
-echo ║  如果浏览器没有自动打开，请手动访问:                         ║
-echo ║  http://localhost:5173                                       ║
-echo ║                                                              ║
-echo ║  服务窗口:                                                   ║
-echo ║  - SCC Server (服务器)                                       ║
-echo ║  - SCC Client (客户端)                                       ║
-echo ║                                                              ║
-echo ║  关闭此窗口不会停止游戏，                                    ║
-echo ║  需要关闭 Server 和 Client 窗口才能完全退出。                ║
-echo ╚══════════════════════════════════════════════════════════════╝
+echo ========================================
+echo   Game started successfully!
+echo.
+echo   If browser did not open, visit:
+echo   http://localhost:5173
+echo.
+echo   Service windows:
+echo   - SCC Server
+echo   - SCC Client
+echo.
+echo   Closing this window will NOT stop
+echo   the game. Close Server and Client
+echo   windows to fully exit.
+echo ========================================
 echo.
 pause
