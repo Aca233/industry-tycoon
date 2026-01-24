@@ -267,7 +267,8 @@ class AutoTradeManager {
         const method = slot.methods.find((m: ProductionMethodData) => m.id === (activeMethodId || slot.defaultMethodId));
         if (!method) continue;
         
-        const ticksPerDay = 24; // 统一时间体系：1 tick = 1小时，1天 = 24 ticks
+        // 统一时间体系：1 tick = 1天
+        const ticksPerDay = 1;
         const cyclesPerDay = ticksPerDay / method.recipe.ticksRequired;
         
         // 计算每日消耗

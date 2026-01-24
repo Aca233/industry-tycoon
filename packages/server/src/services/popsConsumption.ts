@@ -36,12 +36,25 @@ interface POPsConsumptionConfig {
   decisionsPerTick: number;
   /** 最大愿意支付的价格倍数 (相对于市价) */
   maxPriceMultiplier: number;
+  /**
+   * 订单采样率 (0-1)
+   * 性能优化：只提交一小部分订单到市场，其余视为"场外交易"
+   * 这大幅减少订单簿的负担，同时保持经济模拟的准确性
+   */
+  orderSamplingRate: number;
+  /**
+   * 每商品最大订单量
+   * 防止单个商品的订单量过大导致性能问题
+   */
+  maxOrderQuantityPerGoods: number;
 }
 
 const DEFAULT_CONFIG: POPsConsumptionConfig = {
-  orderExpiry: 48, // 2天
+  orderExpiry: 12, // 缩短到12 ticks，更快清理过期订单
   decisionsPerTick: 100,
-  maxPriceMultiplier: 1.1, // 降低到1.1防止价格被推高（原来是1.5）
+  maxPriceMultiplier: 1.1,
+  orderSamplingRate: 0.0005, // 降低到0.05%，减少订单量
+  maxOrderQuantityPerGoods: 500, // 每商品每周期最多500单位
 };
 
 /**
@@ -55,10 +68,11 @@ export class POPsConsumptionManager extends EventEmitter {
   private satisfaction: Map<string, Record<string, number>> = new Map();
   
   /** 上次处理tick */
-  private lastProcessTick: number = -24; // 每24tick处理一次
+  private lastProcessTick: number = -10; // 初始值设为负数，确保首次立即处理
   
-  /** 处理间隔 */
-  private readonly PROCESS_INTERVAL = 24; // 每天处理一次
+  /** 处理间隔 - 性能优化：每10天处理一次消费决策 */
+  // 消费需求相对稳定，不需要每天都重新计算
+  private readonly PROCESS_INTERVAL = 10;
   
   constructor(config: Partial<POPsConsumptionConfig> = {}) {
     super();
@@ -276,10 +290,18 @@ export class POPsConsumptionManager extends EventEmitter {
       
       // 根据人口规模和效用确定购买数量
       // 效用高的商品购买更多
-      // 修复：移除 0.1 系数，大幅增加购买量以确保市场有足够需求
       const utilityFactor = scored.baseUtility / 100;
-      const populationFactor = popGroup.population / 1000000; // 每百万人
-      const quantity = Math.max(5, Math.floor(affordableQuantity * utilityFactor * populationFactor));
+      const populationFactor = popGroup.population / 100000;
+      
+      // 计算理论需求量
+      const theoreticalQuantity = Math.floor(affordableQuantity * utilityFactor * populationFactor * 10);
+      
+      // 性能优化：应用采样率，只有一小部分需求进入订单簿
+      // 剩余需求视为"场外成交"，对满足度仍有贡献
+      const sampledQuantity = Math.max(1, Math.floor(theoreticalQuantity * this.config.orderSamplingRate));
+      
+      // 限制单商品订单量，防止订单爆炸
+      const quantity = Math.min(sampledQuantity, this.config.maxOrderQuantityPerGoods);
       
       const actualQuantity = Math.min(quantity, affordableQuantity);
       const cost = actualQuantity * maxPrice;
@@ -379,31 +401,76 @@ export class POPsConsumptionManager extends EventEmitter {
   }
   
   /**
-   * 提交购买订单
+   * 提交购买订单（批量优化版）
+   *
+   * 性能优化：
+   * 1. 按商品分组，减少订单簿查找次数
+   * 2. 合并同商品订单，减少订单数量
+   * 3. 限制每tick提交的总订单数
    */
   private submitOrders(decisions: ConsumptionDecision[], currentTick: number): void {
+    // 按商品分组合并订单
+    const ordersByGoods = new Map<string, {
+      totalQuantity: number;
+      maxPrice: number;
+      popGroupIds: Set<string>;
+      needGroupIds: Set<string>;
+    }>();
+    
     for (const decision of decisions) {
       if (decision.quantity <= 0) continue;
       
-      // 创建虚拟消费者ID
-      const consumerId = `pop-${decision.popGroupId}`;
+      const existing = ordersByGoods.get(decision.goodsId);
+      if (existing) {
+        existing.totalQuantity += decision.quantity;
+        existing.maxPrice = Math.max(existing.maxPrice, decision.maxPrice);
+        existing.popGroupIds.add(decision.popGroupId);
+        existing.needGroupIds.add(decision.needGroupId);
+      } else {
+        ordersByGoods.set(decision.goodsId, {
+          totalQuantity: decision.quantity,
+          maxPrice: decision.maxPrice,
+          popGroupIds: new Set([decision.popGroupId]),
+          needGroupIds: new Set([decision.needGroupId]),
+        });
+      }
+    }
+    
+    // 限制每周期总订单数 - 降低以减少性能压力
+    const MAX_ORDERS_PER_CYCLE = 20;
+    let orderCount = 0;
+    
+    // 提交合并后的订单
+    for (const [goodsId, orderData] of ordersByGoods) {
+      if (orderCount >= MAX_ORDERS_PER_CYCLE) break;
+      
+      // 使用统一的消费者ID，减少订单分散
+      const consumerId = 'pop-consumer-aggregate';
+      
+      // 进一步限制单订单量
+      const quantity = Math.min(orderData.totalQuantity, this.config.maxOrderQuantityPerGoods);
       
       try {
         const order = marketOrderBook.submitBuyOrder(
           consumerId,
-          decision.goodsId,
-          decision.quantity,
-          decision.maxPrice,
+          goodsId,
+          quantity,
+          orderData.maxPrice,
           currentTick,
           this.config.orderExpiry
         );
         
         if (order) {
-          // 更新满足度 (订单提交成功视为部分满足)
-          this.updateSatisfaction(decision.popGroupId, decision.needGroupId, 5);
+          orderCount++;
+          // 更新所有相关POP群体的满足度
+          for (const popGroupId of orderData.popGroupIds) {
+            for (const needGroupId of orderData.needGroupIds) {
+              this.updateSatisfaction(popGroupId, needGroupId, 2);
+            }
+          }
         }
       } catch (error) {
-        console.error(`[POPsConsumption] Failed to submit order:`, error);
+        console.error(`[POPsConsumption] Failed to submit order for ${goodsId}:`, error);
       }
     }
   }

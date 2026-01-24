@@ -39,6 +39,7 @@ export interface MarketShareData {
  * - 使用 lastTradePriceCache 缓存最后交易价格，避免每次遍历历史
  * - 使用环形缓冲区思想管理历史记录，减少 slice 操作
  * - 批量清理历史记录而非每次添加时清理
+ * - 增量式撮合：只处理新增的订单，避免重复检查已匹配过的订单
  */
 export class MatchingEngine extends EventEmitter {
   /** 交易ID计数器 */
@@ -58,6 +59,14 @@ export class MatchingEngine extends EventEmitter {
   private volumeCache: Map<string, number> = new Map();
   /** 成交量缓存最大tick数 */
   private readonly VOLUME_CACHE_TICKS = 100;
+  
+  // ===== 增量式撮合优化 =====
+  /** 已处理的订单ID集合（用于增量撮合） */
+  private processedOrderIds: Set<string> = new Set();
+  /** 有新订单的商品ID集合（本tick需要处理） */
+  private goodsWithNewOrders: Set<string> = new Set();
+  /** 上次处理的tick */
+  private lastProcessedTick: number = -1;
   
   constructor() {
     super();
@@ -274,21 +283,120 @@ export class MatchingEngine extends EventEmitter {
   }
   
   /**
+   * 标记商品有新订单（由 marketOrderBook 调用）
+   */
+  markNewOrder(goodsId: string, orderId: string): void {
+    this.goodsWithNewOrders.add(goodsId);
+    // 新订单不在已处理集合中
+  }
+  
+  /**
    * 处理所有商品的订单撮合
+   *
+   * 性能优化：
+   * 1. 只处理有活跃订单的商品
+   * 2. 优先处理有新订单的商品（增量式撮合）
+   * 3. 使用快速检查避免不必要的匹配尝试
    */
   processAllMatches(currentTick: number): TradeRecord[] {
     const allTrades: TradeRecord[] = [];
     
-    for (const goods of GOODS_DATA) {
-      const trades = this.matchOrdersForGoods(goods.id, currentTick);
-      allTrades.push(...trades);
+    // 如果是新的tick，重置新订单标记
+    if (currentTick !== this.lastProcessedTick) {
+      this.goodsWithNewOrders.clear();
+      this.lastProcessedTick = currentTick;
+      
+      // 定期清理已处理订单集合，防止内存泄漏
+      if (currentTick % 100 === 0) {
+        this.cleanupProcessedOrders();
+      }
     }
     
+    // 优化：只处理有活跃订单的商品
+    const activeGoods = marketOrderBook.getGoodsWithActiveOrders();
+    
+    // 增量优化：优先处理有新订单的商品
+    const priorityGoods = Array.from(this.goodsWithNewOrders);
+    const otherGoods = activeGoods.filter(g => !this.goodsWithNewOrders.has(g));
+    
+    // 合并列表，新订单商品优先
+    const goodsToProcess = [...priorityGoods, ...otherGoods];
+    
+    let checkedCount = 0;
+    let skippedCount = 0;
+    
+    for (const goodsId of goodsToProcess) {
+      // 快速检查：获取订单簿并检查是否有可匹配订单
+      const orderBook = marketOrderBook.getOrderBook(goodsId);
+      if (!orderBook) continue;
+      
+      // 快速跳过：如果没有最佳买价或卖价，不可能有匹配
+      if (orderBook.bestBid === null || orderBook.bestAsk === null) {
+        skippedCount++;
+        continue;
+      }
+      
+      // 快速跳过：如果最高买价 < 最低卖价，不可能有匹配
+      if (orderBook.bestBid < orderBook.bestAsk) {
+        skippedCount++;
+        continue;
+      }
+      
+      checkedCount++;
+      const trades = this.matchOrdersForGoods(goodsId, currentTick);
+      allTrades.push(...trades);
+      
+      // 标记已处理的订单
+      for (const trade of trades) {
+        this.processedOrderIds.add(trade.buyOrderId);
+        this.processedOrderIds.add(trade.sellOrderId);
+      }
+    }
+    
+    // 清除已处理的新订单标记
+    this.goodsWithNewOrders.clear();
+    
     if (allTrades.length > 0) {
-      console.log(`[MatchingEngine] Processed ${allTrades.length} trades this tick`);
+      console.log(`[MatchingEngine] Processed ${allTrades.length} trades (checked ${checkedCount}, skipped ${skippedCount}, total active ${activeGoods.length})`);
     }
     
     return allTrades;
+  }
+  
+  /**
+   * 清理已处理订单集合
+   * 移除不再存在的订单ID
+   */
+  private cleanupProcessedOrders(): void {
+    const validOrderIds = new Set<string>();
+    
+    // 遍历所有活跃订单，保留仍然有效的ID
+    for (const goodsId of marketOrderBook.getGoodsWithActiveOrders()) {
+      const orderBook = marketOrderBook.getOrderBook(goodsId);
+      if (!orderBook) continue;
+      
+      for (const order of orderBook.buyOrders) {
+        if (order.status === 'open' || order.status === 'partial') {
+          validOrderIds.add(order.id);
+        }
+      }
+      for (const order of orderBook.sellOrders) {
+        if (order.status === 'open' || order.status === 'partial') {
+          validOrderIds.add(order.id);
+        }
+      }
+    }
+    
+    // 只保留仍然有效的订单ID
+    const oldSize = this.processedOrderIds.size;
+    this.processedOrderIds = new Set(
+      Array.from(this.processedOrderIds).filter(id => validOrderIds.has(id))
+    );
+    
+    const cleaned = oldSize - this.processedOrderIds.size;
+    if (cleaned > 0) {
+      console.log(`[MatchingEngine] Cleaned up ${cleaned} stale order IDs from processed set`);
+    }
   }
   
   /**
@@ -420,10 +528,10 @@ export class MatchingEngine extends EventEmitter {
   /**
    * 获取特定商品的市场占比数据
    * @param goodsId 商品ID
-   * @param ticks 统计周期（tick数），默认720（约1个月）
+   * @param ticks 统计周期（tick数，1 tick = 1天），默认30（1个月）
    * @param currentTick 当前tick
    */
-  getMarketShare(goodsId: string, ticks: number = 720, currentTick: number = 0): MarketShareData {
+  getMarketShare(goodsId: string, ticks: number = 30, currentTick: number = 0): MarketShareData {
     const startTick = ticks > 0 ? currentTick - ticks : 0;
     const trades = this.tradeHistory.filter(
       t => t.goodsId === goodsId && (ticks <= 0 || t.tick >= startTick)
@@ -472,7 +580,7 @@ export class MatchingEngine extends EventEmitter {
   /**
    * 获取特定公司在特定商品的市场占比
    */
-  getCompanyMarketShare(goodsId: string, companyId: string, ticks: number = 720, currentTick: number = 0): CompanyShare | null {
+  getCompanyMarketShare(goodsId: string, companyId: string, ticks: number = 30, currentTick: number = 0): CompanyShare | null {
     const marketShare = this.getMarketShare(goodsId, ticks, currentTick);
     return marketShare.shares.find(s => s.companyId === companyId) || null;
   }
@@ -486,7 +594,27 @@ export class MatchingEngine extends EventEmitter {
     this.lastTradePriceCache.clear();
     this.lastTradeTick.clear();
     this.volumeCache.clear();
+    this.processedOrderIds.clear();
+    this.goodsWithNewOrders.clear();
+    this.lastProcessedTick = -1;
     console.log('[MatchingEngine] Reset');
+  }
+  
+  /**
+   * 获取撮合引擎统计信息
+   */
+  getMatchingStats(): {
+    processedOrderCount: number;
+    pendingGoodsCount: number;
+    lastProcessedTick: number;
+    tradeHistorySize: number;
+  } {
+    return {
+      processedOrderCount: this.processedOrderIds.size,
+      pendingGoodsCount: this.goodsWithNewOrders.size,
+      lastProcessedTick: this.lastProcessedTick,
+      tradeHistorySize: this.tradeHistory.length,
+    };
   }
 }
 

@@ -244,16 +244,16 @@ export class EconomyManager extends EventEmitter {
   /**
    * 获取市场占比数据
    * @param goodsId 商品ID
-   * @param ticks 统计周期（tick数），默认720（约1个月）
+   * @param ticks 统计周期（tick数），默认30（1个月，1 tick = 1天）
    */
-  getMarketShare(goodsId: string, ticks: number = 720): MarketShareData {
+  getMarketShare(goodsId: string, ticks: number = 30): MarketShareData {
     return matchingEngine.getMarketShare(goodsId, ticks, this.currentTick);
   }
   
   /**
    * 获取玩家在特定商品的市场占比
    */
-  getPlayerMarketShare(companyId: string, goodsId: string, ticks: number = 720): CompanyShare | null {
+  getPlayerMarketShare(companyId: string, goodsId: string, ticks: number = 30): CompanyShare | null {
     return matchingEngine.getCompanyMarketShare(goodsId, companyId, ticks, this.currentTick);
   }
   

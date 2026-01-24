@@ -1,25 +1,24 @@
 /**
  * Game constants and configuration values
  *
- * 统一时间体系：1 tick = 1小时
- * - 游戏以"小时"为最小时间单位
- * - 1天 = 24 ticks
- * - 1月 = 720 ticks (30天)
- * - 实时200ms/tick，1x速度下1游戏天约5分钟
+ * 统一时间体系：1 tick = 1天
+ * - 游戏以"天"为最小时间单位
+ * - 1周 = 7 ticks
+ * - 1月 = 30 ticks
+ * - 1年 = 365 ticks
+ * - 实时200ms/tick，1x速度下1游戏月约6秒
  */
 
-/** Time and tick settings (1 tick = 1 hour) */
+/** Time and tick settings (1 tick = 1 day) */
 export const TIME_CONSTANTS = {
-  /** Ticks per in-game hour (基本单位) */
-  TICKS_PER_HOUR: 1,
-  /** Ticks per in-game day (24 hours) */
-  TICKS_PER_DAY: 24,
+  /** Ticks per in-game day (基本单位) */
+  TICKS_PER_DAY: 1,
   /** Ticks per in-game week (7 days) */
-  TICKS_PER_WEEK: 168,
+  TICKS_PER_WEEK: 7,
   /** Ticks per in-game month (30 days) */
-  TICKS_PER_MONTH: 720,
+  TICKS_PER_MONTH: 30,
   /** Ticks per in-game year (365 days) */
-  TICKS_PER_YEAR: 8760,
+  TICKS_PER_YEAR: 365,
   /** Default real-time milliseconds per tick at normal speed */
   MS_PER_TICK_NORMAL: 200,
 } as const;
@@ -72,16 +71,16 @@ export const PRODUCTION_CONSTANTS = {
 export const MARKET_CONSTANTS = {
   /** Maximum listings per company */
   MAX_LISTINGS_PER_COMPANY: 100,
-  /** Listing expiry in ticks */
-  DEFAULT_LISTING_EXPIRY_TICKS: 720, // 1 month
+  /** Listing expiry in ticks (1 tick = 1天，30天过期) */
+  DEFAULT_LISTING_EXPIRY_TICKS: 30, // 1 month
   
-  /** Price history retention (ticks) */
-  PRICE_HISTORY_RETENTION: 8760, // 1 year
+  /** Price history retention (ticks) - 1年的数据 */
+  PRICE_HISTORY_RETENTION: 365, // 1 year
   
   /** Trend minimum duration (ticks) */
-  TREND_MIN_DURATION: 168, // 1 week
+  TREND_MIN_DURATION: 7, // 1 week
   /** Trend maximum duration */
-  TREND_MAX_DURATION: 2160, // 3 months
+  TREND_MAX_DURATION: 90, // 3 months
   
   /** Supply/demand imbalance threshold for price movement */
   IMBALANCE_THRESHOLD: 0.05, // 5%失衡就触发价格调整
@@ -92,13 +91,13 @@ export const MARKET_CONSTANTS = {
   /** Base demand fluctuation amplitude (±30%) */
   DEMAND_FLUCTUATION_AMPLITUDE: 0.3,
   /** Demand fluctuation cycle length in ticks (约1个月) */
-  DEMAND_FLUCTUATION_CYCLE: 720,
+  DEMAND_FLUCTUATION_CYCLE: 30,
 } as const;
 
 /** AI constants */
 export const AI_CONSTANTS = {
-  /** AI decision interval (ticks) */
-  AI_DECISION_INTERVAL: 24, // Daily
+  /** AI decision interval (ticks) - 1 tick = 1天，每天决策一次 */
+  AI_DECISION_INTERVAL: 1, // Daily
   /** Memory retention (number of interactions) */
   AI_MEMORY_SIZE: 100,
   

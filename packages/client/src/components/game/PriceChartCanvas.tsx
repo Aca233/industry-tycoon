@@ -1,81 +1,86 @@
 /**
- * PriceChartCanvas - 使用新的交互式图表组件
- * 包装 InteractiveChart 实现价格走势图
+ * PriceChartCanvas - 价格走势图组件
+ * 使用轻量级 Canvas 实现，高性能实时更新
  */
 
-import { useRef, useEffect, useMemo, useState, memo } from 'react';
+import { useRef, useEffect, useState, useMemo } from 'react';
 import type { PriceHistoryEntry } from '../../stores';
-import { InteractiveChart } from '../charts';
-import type { PriceData } from '../charts';
-
-// 时间范围选项
-type TimeRange = '30m' | '1h' | '3h' | '6h' | '12h' | '1d';
-const TIME_RANGES: { value: TimeRange; label: string; ticks: number }[] = [
-  { value: '30m', label: '30分', ticks: 30 },
-  { value: '1h', label: '1小时', ticks: 60 },
-  { value: '3h', label: '3小时', ticks: 180 },
-  { value: '6h', label: '6小时', ticks: 360 },
-  { value: '12h', label: '12小时', ticks: 720 },
-  { value: '1d', label: '1天', ticks: 1440 },
-];
+import { useGameStore } from '../../stores';
+import { SimplePriceChart } from './SimplePriceChart';
 
 interface PriceChartCanvasProps {
   history: PriceHistoryEntry[];
+  goodsId?: string;  // 商品ID，用于区分不同图表
+  tick?: number;     // 当前 tick，用于触发更新
   width?: number;
   height?: number;
 }
 
-// 转换数据格式
-function convertToChartData(history: PriceHistoryEntry[]): PriceData[] {
-  return history.map(h => ({
-    tick: h.tick,
-    price: h.price,
-    volume: (h.buyVolume || 0) + (h.sellVolume || 0),
-    buyVolume: h.buyVolume,
-    sellVolume: h.sellVolume,
-  }));
-}
-
 // Canvas 价格图表组件
-const PriceChartCanvas = memo(function PriceChartCanvas({
+function PriceChartCanvas({
   history,
+  goodsId,
+  tick,
   width = 400,
   height = 220,
 }: PriceChartCanvasProps) {
-  // 转换数据格式
-  const chartData = useMemo(() => convertToChartData(history), [history]);
-
   if (history.length < 2) {
     return (
-      <div className="flex items-center justify-center text-gray-500 text-sm" style={{ width, height }}>
+      <div
+        className="flex items-center justify-center text-gray-500 text-sm"
+        style={{ width, height }}
+      >
         等待价格数据...
       </div>
     );
   }
 
+  const toolbarHeight = 32;
+  const chartHeight = height - toolbarHeight;
+  
   return (
-    <InteractiveChart
-      data={chartData}
-      width={width}
-      height={height}
-      initialMode="line"
-      showVolume={true}
-      showMA={true}
-      showToolbar={true}
-      formatPrice={(cents) => `¥${(cents / 100).toFixed(1)}`}
-    />
-  );
-});
+    <div className="bg-slate-900/50 rounded-lg overflow-hidden">
+      {/* 简化的工具栏 - 只显示标题和数据统计 */}
+      <div className="flex items-center gap-1 px-2 py-1 border-b border-slate-700/50">
+        <span className="text-xs text-cyan-400">📈 价格走势</span>
+        <div className="flex-1" />
+        <span className="text-xs text-slate-500">{history.length}/{history.length}</span>
+      </div>
 
-// 响应式图表包装器
-export const PriceChartWrapperCanvas = memo(function PriceChartWrapperCanvas({
-  history
+      {/* 使用轻量级 Canvas 图表 */}
+      <SimplePriceChart
+        data={history}
+        width={width}
+        height={chartHeight}
+        lineColor="#00d4ff"
+        fillColor="rgba(0, 212, 255, 0.15)"
+        gridColor="rgba(100, 116, 139, 0.2)"
+        textColor="#94a3b8"
+      />
+    </div>
+  );
+}
+
+// 响应式图表包装器 - 直接从 store 获取数据，确保实时更新
+export function PriceChartWrapperCanvas({
+  goodsId,
 }: {
-  history: PriceHistoryEntry[]
+  history?: PriceHistoryEntry[];  // 保留参数兼容性，但不再使用
+  goodsId?: string;
 }) {
+  // 分别订阅原子值，避免选择器返回对象导致的无限循环
+  const currentTick = useGameStore((state) => state.currentTick);
+  const priceHistoryMap = useGameStore((state) => state.priceHistory);
+  
+  // 使用 useMemo 计算 history，依赖 currentTick 触发更新
+  const history = useMemo(() => {
+    if (!goodsId) return [];
+    return priceHistoryMap.get(goodsId) ?? [];
+  }, [goodsId, priceHistoryMap, currentTick]);
+  
+  
   const containerRef = useRef<HTMLDivElement>(null);
   const [dimensions, setDimensions] = useState<{ width: number; height: number } | null>(null);
-  const [timeRange, setTimeRange] = useState<TimeRange>('6h');
 
   useEffect(() => {
     const updateDimensions = () => {
@@ -84,7 +89,7 @@ export const PriceChartWrapperCanvas = memo(function PriceChartWrapperCanvas({
         if (rect.width > 0) {
           setDimensions({
             width: Math.max(300, rect.width - 24),
-            height: 260,
+            height: 280,
           });
         }
       }
@@ -102,60 +107,34 @@ export const PriceChartWrapperCanvas = memo(function PriceChartWrapperCanvas({
     return () => resizeObserver.disconnect();
   }, []);
 
-  // 根据时间范围筛选数据
-  const filteredHistory = useMemo(() => {
-    const rangeConfig = TIME_RANGES.find(r => r.value === timeRange);
-    if (!rangeConfig || rangeConfig.ticks === Infinity) {
-      return history;
-    }
-    return history.slice(-rangeConfig.ticks);
-  }, [history, timeRange]);
-
   return (
     <div
       ref={containerRef}
       className="bg-slate-800/50 rounded-lg p-3"
-      style={{ minHeight: '290px' }}
+      style={{ minHeight: '280px' }}
     >
-      {/* 时间范围选择器 */}
-      <div className="flex items-center justify-between mb-2">
-        <div className="text-[10px] text-gray-500">
-          数据点: {filteredHistory.length} / {history.length}
-        </div>
-        <div className="flex gap-1">
-          {TIME_RANGES.map(range => (
-            <button
-              key={range.value}
-              onClick={() => setTimeRange(range.value)}
-              className={`px-2 py-0.5 text-[10px] rounded transition-colors ${
-                timeRange === range.value
-                  ? 'bg-cyan-600 text-white'
-                  : 'bg-slate-700 text-gray-400 hover:bg-slate-600'
-              }`}
-            >
-              {range.label}
-            </button>
-          ))}
-        </div>
-      </div>
-      
-      {/* 图表内容 */}
+      {/* 图表内容 - 基于 KLineChart */}
       {dimensions ? (
         <PriceChartCanvas
-          history={filteredHistory}
+          history={history}
+          goodsId={goodsId}
+          tick={currentTick}
           width={dimensions.width}
-          height={dimensions.height - 30}
+          height={dimensions.height}
         />
       ) : (
-        <div className="flex items-center justify-center" style={{ height: '220px' }}>
+        <div className="flex items-center justify-center" style={{ height: '240px' }}>
           <div className="flex flex-col items-center gap-2">
-            <div className="w-full h-32 bg-slate-700/30 rounded animate-pulse" style={{ width: '100%', minWidth: '300px' }} />
+            <div
+              className="w-full h-32 bg-slate-700/30 rounded animate-pulse"
+              style={{ width: '100%', minWidth: '300px' }}
+            />
             <span className="text-xs text-gray-500">加载图表...</span>
           </div>
         </div>
       )}
     </div>
   );
-});
+}
 
 export { PriceChartCanvas };

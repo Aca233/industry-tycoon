@@ -1,13 +1,12 @@
 /**
  * K线图表组件
- * 使用新的 InteractiveChart 组件实现
- * 支持数据聚合和时间周期选择
+ * 使用 KLineChart 实现的股票K线图
  */
 
-import React, { useMemo, memo } from 'react';
+import { useMemo, memo } from 'react';
 import type { StockPriceHistory } from '@scc/shared';
-import { InteractiveChart } from '../charts';
-import type { PriceData } from '../charts';
+import { StockChart } from '../charts-v2';
+import type { StockPriceHistoryEntry } from '../charts-v2';
 
 interface CandlestickChartProps {
   data: StockPriceHistory[];
@@ -15,31 +14,32 @@ interface CandlestickChartProps {
   height?: number;
   showVolume?: boolean;
   className?: string;
-  /** 初始聚合周期（tick数），默认60（1小时） */
-  initialTimeframe?: number;
 }
 
-// 转换数据格式
-function convertToChartData(data: StockPriceHistory[]): PriceData[] {
+// 转换数据格式为 StockChart 需要的格式
+function convertToStockData(data: StockPriceHistory[]): StockPriceHistoryEntry[] {
   if (!data || data.length === 0) return [];
   
   return data.map(d => ({
     tick: d.tick,
-    price: d.close,  // 使用收盘价作为主价格
+    open: d.open,
+    high: d.high,
+    low: d.low,
+    close: d.close,
     volume: d.volume,
+    turnover: d.turnover,
   }));
 }
 
-export const CandlestickChart: React.FC<CandlestickChartProps> = memo(function CandlestickChart({
+export const CandlestickChart = memo(function CandlestickChart({
   data,
   width = 600,
   height = 300,
   showVolume = true,
   className = '',
-  initialTimeframe = 60,
-}) {
+}: CandlestickChartProps) {
   // 转换数据格式
-  const chartData = useMemo(() => convertToChartData(data), [data]);
+  const stockData = useMemo(() => convertToStockData(data), [data]);
   
   if (!data || data.length === 0) {
     return (
@@ -51,16 +51,12 @@ export const CandlestickChart: React.FC<CandlestickChartProps> = memo(function C
   }
   
   return (
-    <InteractiveChart
-      data={chartData}
+    <StockChart
+      data={stockData}
       width={width}
       height={height}
-      initialMode="candle"
       showVolume={showVolume}
-      showMA={true}
       showToolbar={true}
-      initialTimeframe={initialTimeframe}
-      formatPrice={(cents) => `$${(cents / 100).toFixed(2)}`}
       className={className}
     />
   );

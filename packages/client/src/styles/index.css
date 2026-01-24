@@ -2,6 +2,9 @@
 @tailwind components;
 @tailwind utilities;
 
+/* 导入视觉效果样式 */
+@import './effects.css';
+
 /* Custom scrollbar styles */
 ::-webkit-scrollbar {
   width: 8px;

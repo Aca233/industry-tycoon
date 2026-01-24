@@ -499,8 +499,8 @@ export const VALUATION_CONSTANTS = {
   /** 成交量平滑系数 */
   VOLUME_SMOOTHING: 0.1,
   
-  /** 分红频率（tick数，每月一次） */
-  DIVIDEND_FREQUENCY: 720,
+  /** 分红频率（tick数，每月一次，1 tick = 1天） */
+  DIVIDEND_FREQUENCY: 30,
   
   /** 分红比例上限 */
   MAX_DIVIDEND_PAYOUT: 0.5, // 净利润的50%
@@ -514,8 +514,8 @@ export const VALUATION_CONSTANTS = {
   /** 绝对控制比例 */
   ABSOLUTE_CONTROL: 0.67, // 67%
   
-  /** 股票订单默认过期时间（tick数） */
-  DEFAULT_ORDER_EXPIRY: 48, // 2天
+  /** 股票订单默认过期时间（tick数，1 tick = 1天） */
+  DEFAULT_ORDER_EXPIRY: 2, // 2天
   
   /** 初始股价基数 */
   INITIAL_STOCK_PRICE_BASE: 10000, // ¥100.00 (以分为单位)

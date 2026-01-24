@@ -412,10 +412,47 @@ export const useGameStore = create<GameStore>()(
         
         gameWebSocket.on('buildingAdded', (msg: WSMessage) => {
           const payload = msg.payload as {
-            building: { id: string; definitionId: string; name: string; position: { x: number; y: number }; efficiency: number; utilization: number; status: string };
+            building: {
+              id: string;
+              definitionId: string;
+              name: string;
+              position: { x: number; y: number };
+              efficiency: number;
+              utilization: number;
+              status: string;
+              constructionProgress?: number;
+              constructionTimeRequired?: number;
+              productionProgress?: number;
+            };
             playerCash: number;
           };
           set((state) => {
+            // 根据服务端状态确定 operationalStatus
+            const serverStatus = payload.building.status;
+            let operationalStatus: string;
+            switch (serverStatus) {
+              case 'running':
+                operationalStatus = OperationalStatus.Operational;
+                break;
+              case 'paused':
+                operationalStatus = OperationalStatus.Paused;
+                break;
+              case 'no_input':
+                operationalStatus = OperationalStatus.LackingInputs;
+                break;
+              case 'no_power':
+                operationalStatus = OperationalStatus.LackingEnergy;
+                break;
+              case 'under_construction':
+                operationalStatus = 'under_construction'; // 建造中
+                break;
+              case 'waiting_materials':
+                operationalStatus = 'waiting_materials'; // 等待材料
+                break;
+              default:
+                operationalStatus = OperationalStatus.Operational;
+            }
+            
             // Add building to map
             state.buildings.set(payload.building.id, {
               id: payload.building.id,
@@ -431,7 +468,7 @@ export const useGameStore = create<GameStore>()(
               inputInventory: [],
               outputInventory: [],
               createdAt: Date.now(),
-              operationalStatus: payload.building.status as 'running' | 'paused' | 'maintenance' | 'disabled',
+              operationalStatus: operationalStatus as 'running' | 'paused' | 'maintenance' | 'disabled',
               inputCapacity: 1000,
               outputCapacity: 1000,
               currentWorkers: 10,
@@ -439,6 +476,11 @@ export const useGameStore = create<GameStore>()(
               maintenanceCost: 1000,
               lastMaintenanceTick: 0,
               productionQueue: [],
+              // 保存服务端的原始状态供前端显示使用
+              serverStatus: serverStatus,
+              productionProgress: payload.building.productionProgress ?? 0,
+              constructionProgress: payload.building.constructionProgress,
+              constructionTimeRequired: payload.building.constructionTimeRequired,
             } as unknown as BuildingInstance);
             
             // Update player cash
@@ -508,6 +550,32 @@ export const useGameStore = create<GameStore>()(
                 || (b.activeMethodIds as Record<string, string>)?.process
                 || '';
               
+              // 从服务端获取建筑状态，映射到 operationalStatus
+              const serverStatus = (b as { status?: string }).status;
+              let operationalStatus: string;
+              switch (serverStatus) {
+                case 'running':
+                  operationalStatus = OperationalStatus.Operational;
+                  break;
+                case 'paused':
+                  operationalStatus = OperationalStatus.Paused;
+                  break;
+                case 'no_input':
+                  operationalStatus = OperationalStatus.LackingInputs;
+                  break;
+                case 'no_power':
+                  operationalStatus = OperationalStatus.LackingEnergy;
+                  break;
+                case 'under_construction':
+                  operationalStatus = 'under_construction'; // 建造中
+                  break;
+                case 'waiting_materials':
+                  operationalStatus = 'waiting_materials'; // 等待材料
+                  break;
+                default:
+                  operationalStatus = OperationalStatus.Operational;
+              }
+              
               state.buildings.set(b.id, {
                 id: b.id,
                 definitionId: b.type,
@@ -523,7 +591,7 @@ export const useGameStore = create<GameStore>()(
                 inputInventory: [],
                 outputInventory: [],
                 createdAt: Date.now(),
-                operationalStatus: 'running',
+                operationalStatus: operationalStatus as 'running' | 'paused' | 'maintenance' | 'disabled',
                 inputCapacity: 1000,
                 outputCapacity: 1000,
                 currentWorkers: 10,
@@ -531,6 +599,11 @@ export const useGameStore = create<GameStore>()(
                 maintenanceCost: 1000,
                 lastMaintenanceTick: 0,
                 productionQueue: [],
+                // 保存服务端的原始状态供前端显示使用
+                serverStatus: serverStatus,
+                productionProgress: (b as { productionProgress?: number }).productionProgress ?? 0,
+                constructionProgress: (b as { constructionProgress?: number }).constructionProgress,
+                constructionTimeRequired: (b as { constructionTimeRequired?: number }).constructionTimeRequired,
               } as unknown as BuildingInstance);
             });
           });
@@ -644,8 +717,9 @@ export const useGameStore = create<GameStore>()(
         // 这导致价格没有变化的商品会缺失数据点，造成图表稀疏
         // 现在：遍历所有已知价格，确保每个 tick 都有完整记录
         const tickVolumes = tickPayloadWithDelta.tickVolumes;
-        const MAX_HISTORY = 720; // 30天的数据点（1 tick = 1小时）
-        const CLEANUP_THRESHOLD = 900;
+        // 1 tick = 1 day，保留3650天（10年）的数据点
+        const MAX_HISTORY = 3650;
+        const CLEANUP_THRESHOLD = 4000;
         
         // 只有在有价格数据时才记录历史
         if (Object.keys(state.marketPrices).length > 0) {
@@ -805,6 +879,53 @@ export const useGameStore = create<GameStore>()(
           state.buildingShortages = [];
           for (const [, building] of state.buildings) {
             building.operationalStatus = OperationalStatus.Operational;
+          }
+        }
+        
+        // Handle buildings progress (construction progress, status updates)
+        const buildingsProgressPayload = (payload as unknown as {
+          buildingsProgress?: Array<{
+            buildingId: string;
+            status: 'under_construction' | 'waiting_materials' | 'running' | 'no_input';
+            constructionProgress?: number;
+            constructionTimeRequired?: number;
+            productionProgress?: number;
+          }>;
+        }).buildingsProgress;
+        
+        if (buildingsProgressPayload && buildingsProgressPayload.length > 0) {
+          for (const progress of buildingsProgressPayload) {
+            const building = state.buildings.get(progress.buildingId);
+            if (building) {
+              // Update construction progress
+              if (progress.constructionProgress !== undefined) {
+                (building as unknown as { constructionProgress?: number }).constructionProgress = progress.constructionProgress;
+              }
+              if (progress.constructionTimeRequired !== undefined) {
+                (building as unknown as { constructionTimeRequired?: number }).constructionTimeRequired = progress.constructionTimeRequired;
+              }
+              if (progress.productionProgress !== undefined) {
+                (building as unknown as { productionProgress?: number }).productionProgress = progress.productionProgress;
+              }
+              
+              // Update status and operationalStatus
+              (building as unknown as { serverStatus: string }).serverStatus = progress.status;
+              
+              switch (progress.status) {
+                case 'under_construction':
+                  building.operationalStatus = 'under_construction' as unknown as typeof OperationalStatus.Operational;
+                  break;
+                case 'waiting_materials':
+                  building.operationalStatus = 'waiting_materials' as unknown as typeof OperationalStatus.Operational;
+                  break;
+                case 'running':
+                  building.operationalStatus = OperationalStatus.Operational;
+                  break;
+                case 'no_input':
+                  building.operationalStatus = OperationalStatus.LackingInputs;
+                  break;
+              }
+            }
           }
         }
         

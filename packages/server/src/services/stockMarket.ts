@@ -68,11 +68,11 @@ const PRICE_FORMATION = {
   VOLUME_IMPACT_FACTOR: 0.0001,     // 成交量对波动的放大系数
   
   // 新上市股票保护期（tick数）
-  IPO_GRACE_PERIOD: 720,            // 30天保护期（从48提高到720）
+  IPO_GRACE_PERIOD: 30,             // 30天保护期（1 tick = 1天）
   IPO_VOLATILITY_DAMPENER: 0.3,     // 保护期内波动率降低为30%
   
   // 稳定期要求（需要多少tick的财务数据才启用估值）
-  MIN_FINANCIAL_HISTORY: 720,       // 30天财务历史
+  MIN_FINANCIAL_HISTORY: 30,        // 30天财务历史（1 tick = 1天）
 };
 
 /**
@@ -262,8 +262,8 @@ export class StockMarketService extends EventEmitter {
   /** 上一交易日开盘tick */
   private lastTradingDayStart: GameTick = 0;
   
-  /** 每日tick数（24小时） */
-  private readonly TICKS_PER_DAY = 24;
+  /** 每日tick数（1 tick = 1天） */
+  private readonly TICKS_PER_DAY = 1;
   
   constructor() {
     super();
@@ -628,7 +628,7 @@ export class StockMarketService extends EventEmitter {
       
       const financials: CompanyFinancials = {
         companyId,
-        period: { startTick: currentTick - 720, endTick: currentTick },
+        period: { startTick: currentTick - 30, endTick: currentTick },
         totalRevenue: Math.max(0, data.netIncome * 1.5), // 估算
         totalCost: Math.max(0, data.netIncome * 0.5),
         netIncome: data.netIncome,
@@ -1701,7 +1701,7 @@ export class StockMarketService extends EventEmitter {
       pledgedShares: 0,
       status: TakeoverStatus.Pending,
       initiatedTick: currentTick,
-      expiryTick: currentTick + 720, // 30天有效期
+      expiryTick: currentTick + 30, // 30天有效期（1 tick = 1天）
       rationale,
       hostile: true, // 默认为敌意收购
       defenseActivated: false,

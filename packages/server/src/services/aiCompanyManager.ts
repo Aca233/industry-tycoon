@@ -12,6 +12,10 @@ import {
   AIPersonality,
   CompanyType,
   getGoodsDefinition,
+  getConstructionTime,
+  getConstructionMaterials,
+  getBuildingDef,
+  calculateConstructionCost,
 } from '@scc/shared';
 import type { BuildingInstance, SupplyDemandData } from './gameLoop.js';
 import { llmService, type StrategicPlan } from './llm.js';
@@ -131,7 +135,7 @@ export class AICompanyManager {
   private asyncNewsQueue: Array<{ companyId: string; headline: string }> = [];
   
   /** 性能优化：分批处理AI公司，每tick只处理一部分 */
-  private readonly BATCH_SIZE = 5; // 每tick处理5个公司
+  private readonly BATCH_SIZE = 10; // 每tick处理10个公司（增加以提高市场活跃度）
   private currentBatchIndex = 0;
   
   /** 性能优化：每公司最大建筑数限制（有聚合因子后可提高） */
@@ -187,15 +191,16 @@ export class AICompanyManager {
       const aggregatedCount = building.aggregatedCount ?? 1;
       
       // 统计输入需求（30天库存）× 聚合因子
+      // 注意：1 tick = 1 day，所以30天 = 30 ticks
       for (const input of method.recipe.inputs) {
         const current = inputNeeds.get(input.goodsId) ?? 0;
-        inputNeeds.set(input.goodsId, current + input.amount * 24 * 30 * aggregatedCount);
+        inputNeeds.set(input.goodsId, current + input.amount * 30 * aggregatedCount);
       }
       
       // 统计输出产品（15天库存）× 聚合因子
       for (const output of method.recipe.outputs) {
         const current = outputProducts.get(output.goodsId) ?? 0;
-        outputProducts.set(output.goodsId, current + output.amount * 24 * 15 * aggregatedCount);
+        outputProducts.set(output.goodsId, current + output.amount * 15 * aggregatedCount);
       }
     }
     
@@ -328,9 +333,29 @@ export class AICompanyManager {
     return this.companies.get(id);
   }
   
+  /** 性能优化：决策节流，每公司15-35 tick决策一次（进一步提高性能） */
+  private decisionThrottles: Map<string, number> = new Map();
+  private readonly DECISION_INTERVAL_MIN = 15;  // 从10改为15
+  private readonly DECISION_INTERVAL_MAX = 35;  // 从25改为35
+  
+  /** 性能优化：每tick最多处理多少个AI公司的决策（从3改为2） */
+  private readonly MAX_DECISIONS_PER_TICK = 2;
+  
+  /** 性能优化：市场分析结果缓存 */
+  private marketAnalysisCache: {
+    tick: number;
+    gaps: Array<{ goodsId: string; shortage: number; buildingId: string | null }>;
+    playerDependencies: string[];
+  } | null = null;
+  private readonly CACHE_TTL = 5; // 缓存5 tick
+  
   /**
    * 处理AI回合
-   * 性能优化：分批处理AI公司，每tick只处理BATCH_SIZE个公司的订单和生产
+   * 性能优化：
+   * 1. 分批处理AI公司生产和订单
+   * 2. AI决策节流 - 每5-15 tick决策一次
+   * 3. 已达建筑上限的公司快速跳过
+   * 4. 每tick最多处理3个公司的决策
    */
   processTick(context: GameContext): {
     events: CompetitionEvent[];
@@ -349,12 +374,15 @@ export class AICompanyManager {
     const companiesArray = Array.from(this.companies.values());
     const totalCompanies = companiesArray.length;
     
-    // 计算当前批次应该处理的公司范围
+    // 计算当前批次应该处理的公司范围（生产和订单）
     const batchStart = this.currentBatchIndex * this.BATCH_SIZE;
     const batchEnd = Math.min(batchStart + this.BATCH_SIZE, totalCompanies);
     
     // 更新批次索引（循环）
     this.currentBatchIndex = (this.currentBatchIndex + 1) % Math.ceil(totalCompanies / this.BATCH_SIZE);
+    
+    // 【性能优化】统计本tick处理的决策数
+    let decisionsThisTick = 0;
     
     for (let i = 0; i < totalCompanies; i++) {
       const company = companiesArray[i];
@@ -370,10 +398,24 @@ export class AICompanyManager {
         strategyRefreshed = true; // 本tick只刷新一个公司
       }
       
-      // 检查是否到决策时间（规则驱动的小决策）- 所有公司都检查
-      if (context.currentTick - company.lastDecisionTick >= company.decisionInterval) {
-        this.processCompanyDecision(company, context);
-        company.lastDecisionTick = context.currentTick;
+      // 【性能优化】限制每tick处理的决策数量
+      if (decisionsThisTick < this.MAX_DECISIONS_PER_TICK) {
+        // 检查决策节流
+        const lastDecisionTick = this.decisionThrottles.get(company.id) || 0;
+        // 计算该公司的决策间隔（基于公司ID哈希，分散决策时机）
+        const companyHash = company.id.charCodeAt(company.id.length - 1) || 0;
+        const decisionInterval = this.DECISION_INTERVAL_MIN + (companyHash % (this.DECISION_INTERVAL_MAX - this.DECISION_INTERVAL_MIN + 1));
+        
+        if (context.currentTick - lastDecisionTick >= decisionInterval) {
+          // 【性能优化】已达建筑上限的公司使用快速路径
+          if (company.buildings.length >= this.MAX_BUILDINGS_PER_COMPANY) {
+            this.processCompanyDecisionFast(company, context);
+          } else {
+            this.processCompanyDecision(company, context);
+          }
+          this.decisionThrottles.set(company.id, context.currentTick);
+          decisionsThisTick++;
+        }
       }
       
       // 【性能优化】只有当前批次的公司才处理生产和订单
@@ -393,8 +435,54 @@ export class AICompanyManager {
   }
   
   /**
+   * 快速决策处理（已达建筑上限的公司）
+   * 只检查是否需要切换生产方法，跳过扩张逻辑
+   */
+  private processCompanyDecisionFast(company: AICompanyState, context: GameContext): void {
+    // 每20 tick才检查一次方法优化
+    if (context.currentTick % 20 !== 0) return;
+    
+    // 查找效率低于70%的建筑，切换生产方法
+    for (const building of company.buildings) {
+      if (building.efficiency < 0.7 || building.utilization < 0.5) {
+        const def = BUILDINGS_DATA.find(b => b.id === building.definitionId);
+        if (!def) continue;
+        
+        const slot = def.productionSlots[0];
+        if (!slot || slot.methods.length < 2) continue;
+        
+        // 切换到下一个方法
+        const currentIndex = slot.methods.findIndex(m => m.id === building.currentMethodId);
+        const nextIndex = (currentIndex + 1) % slot.methods.length;
+        const nextMethod = slot.methods[nextIndex];
+        if (nextMethod) {
+          building.currentMethodId = nextMethod.id;
+          // 减少日志输出
+        }
+        break; // 每次只处理一个建筑
+      }
+    }
+  }
+  
+  /** 性能优化：订单提交节流 - 记录每个公司上次提交订单的tick */
+  private orderThrottles: Map<string, number> = new Map();
+  
+  /** 性能优化：每tick最多提交的订单数 */
+  private readonly MAX_ORDERS_PER_TICK = 20;  // 从10改回20，增加市场流动性
+  
+  /** 性能优化：订单提交间隔 (ticks) */
+  private readonly ORDER_INTERVAL = 10;  // 从25改为10，更频繁地提交订单
+  
+  /**
    * 处理AI公司的市场订单（买入原料、卖出产品）
-   * 性能优化：降低订单提交频率从每2-4 tick改为每10-15 tick
+   * 性能优化：
+   * 1. 降低订单提交频率到每10 tick（从25改为10）
+   * 2. 每tick最多提交20个订单（从10改为20）
+   * 3. 合并同类商品的订单
+   *
+   * 重要修复：
+   * - 不仅检查running状态建筑的产品，还检查库存中所有可卖的商品
+   * - 这确保初始库存和之前生产的商品都能被出售
    */
   private processMarketOrders(company: AICompanyState, context: GameContext): void {
     const config = AI_COMPANIES_CONFIG.find(c => c.id === company.id);
@@ -403,12 +491,18 @@ export class AICompanyManager {
     const inventory = inventoryManager.getInventory(company.id);
     if (!inventory) return;
     
-    // 【性能优化】每隔一定tick提交订单
-    // 原逻辑每2-4 tick提交一次导致性能问题，改为每10-15 tick
-    const orderInterval = Math.max(10, Math.min(15, Math.floor(config.decisionInterval / 2)));
-    if (context.currentTick % orderInterval !== 0) return;
+    // 【性能优化】检查订单节流 - 降低到每10 tick
+    const lastOrderTick = this.orderThrottles.get(company.id) || 0;
+    if (context.currentTick - lastOrderTick < this.ORDER_INTERVAL) return;
     
-    // 分析需要买入的原料和可以卖出的产品
+    // 记录本次订单提交tick
+    this.orderThrottles.set(company.id, context.currentTick);
+    
+    // 【性能优化】合并同类商品的需求
+    const buyNeeds = new Map<string, number>();  // goodsId -> totalAmount
+    const sellNeeds = new Map<string, number>(); // goodsId -> totalAmount
+    
+    // 分析需要买入的原料和可以卖出的产品（基于running状态的建筑）
     for (const building of company.buildings) {
       const def = BUILDINGS_DATA.find(b => b.id === building.definitionId);
       if (!def || building.status !== 'running') continue;
@@ -420,30 +514,72 @@ export class AICompanyManager {
       // 获取聚合因子
       const aggregatedCount = building.aggregatedCount ?? 1;
       
-      // 买入原料（目标库存 × 聚合因子）
+      // 统计买入需求（目标库存7天 × 聚合因子）
       for (const input of method.recipe.inputs) {
-        this.processInputPurchase(company, config, input.goodsId, input.amount * 24 * 7 * aggregatedCount, context);
+        const current = buyNeeds.get(input.goodsId) || 0;
+        buyNeeds.set(input.goodsId, current + input.amount * 7 * aggregatedCount);
       }
       
-      // 卖出产品（考虑聚合因子的产量）
+      // 统计卖出需求（基于生产能力）
       for (const output of method.recipe.outputs) {
-        this.processSellOrder(company, config, output.goodsId, aggregatedCount, context);
+        const current = sellNeeds.get(output.goodsId) || 0;
+        const dailyProduction = output.amount * aggregatedCount / method.recipe.ticksRequired;
+        sellNeeds.set(output.goodsId, current + dailyProduction * 7); // 7天产量
+      }
+    }
+    
+    // 【重要修复】同时检查库存中所有有库存的商品，即使没有running的建筑生产它们
+    // 这确保初始库存和之前生产的商品都能被出售
+    for (const [goodsId, stock] of Object.entries(inventory.stocks)) {
+      const available = stock.quantity - stock.reservedForSale;
+      // 如果库存大于50且不在sellNeeds中，添加它
+      if (available > 50 && !sellNeeds.has(goodsId)) {
+        sellNeeds.set(goodsId, available * 0.5); // 尝试卖出50%
+      }
+    }
+    
+    // 【性能优化】限制每次提交的订单数
+    let ordersSubmitted = 0;
+    
+    // 处理买入订单（合并后）
+    for (const [goodsId, targetStock] of buyNeeds) {
+      if (ordersSubmitted >= this.MAX_ORDERS_PER_TICK) break;
+      if (this.processInputPurchaseBatched(company, config, goodsId, targetStock, context)) {
+        ordersSubmitted++;
+      }
+    }
+    
+    // 处理卖出订单（合并后）
+    for (const [goodsId] of sellNeeds) {
+      if (ordersSubmitted >= this.MAX_ORDERS_PER_TICK) break;
+      if (this.processSellOrderBatched(company, config, goodsId, context)) {
+        ordersSubmitted++;
+      }
+    }
+    
+    // 调试日志（每100 tick输出一次，仅前3家公司）
+    if (context.currentTick % 100 === 0 && company.id.endsWith('-1') || company.id.endsWith('-2') || company.id.endsWith('-3')) {
+      const stockCount = Object.keys(inventory.stocks).length;
+      const totalQuantity = Object.values(inventory.stocks).reduce((sum, s) => sum + s.quantity, 0);
+      if (stockCount > 0 || ordersSubmitted > 0) {
+        console.log(`[AIManager-Orders] ${company.name}: 库存${stockCount}种/${totalQuantity.toFixed(0)}件, 提交${ordersSubmitted}单, 买需${buyNeeds.size}种, 卖需${sellNeeds.size}种`);
       }
     }
   }
   
   /**
-   * 处理原料采购订单
+   * 处理原料采购订单（批量优化版）
+   * @returns 是否成功提交了订单
    */
-  private processInputPurchase(
+  private processInputPurchaseBatched(
     company: AICompanyState,
     config: AICompanyConfig,
     goodsId: string,
     targetStock: number,
     context: GameContext
-  ): void {
+  ): boolean {
     const inventory = inventoryManager.getInventory(company.id);
-    if (!inventory) return;
+    if (!inventory) return false;
     
     const stock = inventory.stocks[goodsId];
     const currentQuantity = stock?.quantity ?? 0;
@@ -453,70 +589,89 @@ export class AICompanyManager {
       const needToBuy = targetStock - currentQuantity;
       const buyPrice = this.calculateBuyPrice(company, config, goodsId, context);
       
-      // 检查资金是否充足
+      // 检查资金是否充足（提高到50%）
       const totalCost = buyPrice * needToBuy;
-      if (inventory.cash >= totalCost * 0.3) {
-        const buyQuantity = Math.min(needToBuy, inventory.cash / buyPrice * 0.3);
+      if (inventory.cash >= totalCost * 0.5) {
+        const buyQuantity = Math.min(needToBuy, inventory.cash / buyPrice * 0.5);
         
-        if (buyQuantity > 1) {
+        if (buyQuantity > 10) { // 降低阈值增加市场流动性（50→10）
           marketOrderBook.submitBuyOrder(
             company.id,
             goodsId,
             buyQuantity,
             buyPrice,
             context.currentTick,
-            20 // 20 tick过期
+            20 // 20 tick过期（缩短以减少活跃订单）
           );
+          return true;
         }
       }
     }
+    return false;
   }
   
   /**
-   * 处理产品销售订单
-   * @param _aggregatedCount 聚合因子（日产量计算已在estimateDailyProduction内处理）
+   * 处理产品销售订单（批量优化版）
+   * @returns 是否成功提交了订单
+   *
+   * 修复：
+   * - 降低最小可卖数量阈值
+   * - 延长订单有效期
+   * - 如果没有生产能力，不保留库存
    */
-  private processSellOrder(
+  private processSellOrderBatched(
     company: AICompanyState,
     config: AICompanyConfig,
     goodsId: string,
-    _aggregatedCount: number,
     context: GameContext
-  ): void {
+  ): boolean {
     const inventory = inventoryManager.getInventory(company.id);
-    if (!inventory) return;
+    if (!inventory) return false;
     
     const stock = inventory.stocks[goodsId];
-    if (!stock) return;
+    if (!stock) return false;
     
     const available = stock.quantity - stock.reservedForSale;
+    if (available <= 0) return false;
     
-    // 保留7天库存，其余卖出（日产量已包含聚合因子）
+    // 计算日产量（用于确定保留库存）
     const dailyProduction = this.estimateDailyProduction(company, goodsId);
-    const reserveStock = dailyProduction * 7;
+    
+    // 计算保留库存：
+    // - 如果有生产能力，保留3天库存（从7天减少到3天）
+    // - 如果没有生产能力（可能是初始库存），只保留10%
+    let reserveStock: number;
+    if (dailyProduction > 0) {
+      reserveStock = dailyProduction * 3; // 保留3天库存
+    } else {
+      reserveStock = available * 0.1; // 只保留10%
+    }
+    
     const sellableQuantity = available - reserveStock;
     
+    // 降低最小可卖数量阈值到1（从10降低）
     if (sellableQuantity > 1) {
       const sellPrice = this.calculateSellPrice(company, config, goodsId, context);
-      const sellQuantity = sellableQuantity * 0.5; // 每次卖出50%的可卖量
+      // 每次卖出80%的可卖量（从70%提高）
+      const sellQuantity = Math.max(1, sellableQuantity * 0.8);
       
-      if (sellQuantity > 1) {
-        marketOrderBook.submitSellOrder(
-          company.id,
-          goodsId,
-          sellQuantity,
-          sellPrice,
-          context.currentTick,
-          20
-        );
-        inventoryManager.reserveForSale(company.id, goodsId, sellQuantity, context.currentTick);
-      }
+      marketOrderBook.submitSellOrder(
+        company.id,
+        goodsId,
+        sellQuantity,
+        sellPrice,
+        context.currentTick,
+        30 // 延长到30 tick过期（从20提高），给更多成交机会
+      );
+      inventoryManager.reserveForSale(company.id, goodsId, sellQuantity, context.currentTick);
+      return true;
     }
+    return false;
   }
   
   /**
    * 计算买入价格（根据人格调整）
-   * 修正版：缩小价格偏移范围到 ±2%-8%，确保买卖可成交
+   * 修正版：确保买价始终 >= 市价，范围 +0% to +8%，保证能与卖单撮合
    */
   private calculateBuyPrice(
     company: AICompanyState,
@@ -526,37 +681,37 @@ export class AICompanyManager {
   ): number {
     const marketPrice = priceDiscoveryService.getPrice(goodsId);
     
-    // 添加微小随机波动 ±1%
-    const randomFactor = 0.99 + Math.random() * 0.02;
+    // 添加微小随机波动 0~2%（始终正向）
+    const randomFactor = 1.0 + Math.random() * 0.02;
     
-    // 根据人格调整买入策略（收窄范围）
+    // 根据人格调整买入策略（全部在市价之上，确保能成交）
     switch (company.personality) {
       case AIPersonality.Monopolist:
-        // 激进：愿意稍高于市价买入（+2%~+5%）
-        return marketPrice * (1.02 + config.aggressiveness * 0.03) * randomFactor;
+        // 激进：愿意高于市价买入（+3%~+8%）
+        return marketPrice * (1.03 + config.aggressiveness * 0.05) * randomFactor;
         
       case AIPersonality.OldMoney:
-        // 保守：接近市价买入（-1%~+2%）
-        return marketPrice * (0.99 + Math.random() * 0.03) * randomFactor;
+        // 保守：略高于市价买入（+0%~+3%）
+        return marketPrice * (1.0 + Math.random() * 0.03) * randomFactor;
         
       case AIPersonality.TrendSurfer:
-        // 跟风：紧跟市价（-1%~+3%）
-        return marketPrice * (0.99 + Math.random() * 0.04) * randomFactor;
+        // 跟风：市价或略高（+1%~+4%）
+        return marketPrice * (1.01 + Math.random() * 0.03) * randomFactor;
         
       case AIPersonality.CostLeader:
-        // 成本导向：略低于市价（-3%~0%）
-        return marketPrice * (0.97 + Math.random() * 0.03) * randomFactor;
+        // 成本导向：接近市价（+0%~+2%）
+        return marketPrice * (1.0 + Math.random() * 0.02) * randomFactor;
         
       case AIPersonality.Innovator:
       default:
-        // 平衡策略：接近市价（-1%~+2%）
-        return marketPrice * (0.99 + Math.random() * 0.03) * randomFactor;
+        // 平衡策略：市价或略高（+0%~+3%）
+        return marketPrice * (1.0 + Math.random() * 0.03) * randomFactor;
     }
   }
   
   /**
    * 计算卖出价格（根据人格调整）
-   * 修正版：缩小价格偏移范围到 ±2%-8%，确保买卖可成交
+   * 修正版：确保卖价始终 <= 市价，范围 -5% to +2%，保证能与买单撮合
    */
   private calculateSellPrice(
     company: AICompanyState,
@@ -569,34 +724,34 @@ export class AICompanyManager {
     // 检查玩家威胁
     const playerThreat = this.analyzePlayerThreat(company, goodsId, context);
     
-    // 添加微小随机波动 ±1%
-    const randomFactor = 0.99 + Math.random() * 0.02;
+    // 添加微小随机波动 -1%~0%（始终负向或零）
+    const randomFactor = 0.99 + Math.random() * 0.01;
     
-    // 根据人格调整卖出策略（收窄范围）
+    // 根据人格调整卖出策略（大部分在市价之下，确保能成交）
     switch (company.personality) {
       case AIPersonality.Monopolist:
-        // 激进：如果有玩家威胁则降价打压，否则略高于市价（+1%~+5%）
+        // 激进：如果有玩家威胁则降价打压（-5%~-2%），否则接近市价（-2%~+1%）
         if (playerThreat > 0.5) {
-          return marketPrice * (0.95 - config.aggressiveness * 0.03) * randomFactor; // 价格战
+          return marketPrice * (0.95 + Math.random() * 0.03) * randomFactor; // 价格战
         }
-        return marketPrice * (1.01 + config.aggressiveness * 0.04) * randomFactor;
+        return marketPrice * (0.98 + Math.random() * 0.03) * randomFactor;
         
       case AIPersonality.OldMoney:
-        // 保守：略高于市价（+1%~+4%）
-        return marketPrice * (1.01 + Math.random() * 0.03) * randomFactor;
-        
-      case AIPersonality.TrendSurfer:
-        // 跟风：紧跟市价（-1%~+2%）
+        // 保守：接近市价（-1%~+2%）
         return marketPrice * (0.99 + Math.random() * 0.03) * randomFactor;
         
-      case AIPersonality.CostLeader:
-        // 低价策略：略低于市价（-3%~0%）
+      case AIPersonality.TrendSurfer:
+        // 跟风：略低于市价（-3%~0%）
         return marketPrice * (0.97 + Math.random() * 0.03) * randomFactor;
+        
+      case AIPersonality.CostLeader:
+        // 低价策略：低于市价（-5%~-2%）
+        return marketPrice * (0.95 + Math.random() * 0.03) * randomFactor;
         
       case AIPersonality.Innovator:
       default:
-        // 品质溢价：略高于市价（0%~+3%）
-        return marketPrice * (1.0 + Math.random() * 0.03) * randomFactor;
+        // 平衡策略：接近市价（-2%~+1%）
+        return marketPrice * (0.98 + Math.random() * 0.03) * randomFactor;
     }
   }
   
@@ -650,9 +805,10 @@ export class AICompanyManager {
       
       for (const output of method.recipe.outputs) {
         if (output.goodsId === goodsId) {
-          // 每tick产出 * 24小时 * 效率 * 聚合因子
+          // 每tick产出 * 效率 * 聚合因子
+          // 注意：1 tick = 1 day，所以每天周期数 = 1 / ticksPerCycle
           const ticksPerCycle = method.recipe.ticksRequired;
-          const cyclesPerDay = 24 / ticksPerCycle;
+          const cyclesPerDay = 1 / ticksPerCycle;
           dailyOutput += output.amount * cyclesPerDay * building.efficiency * aggregatedCount;
         }
       }
@@ -977,13 +1133,19 @@ export class AICompanyManager {
   }
   
   /**
-   * 分析市场缺口 - 找出供应不足的商品及对应工厂
+   * 分析市场缺口 - 找出供应不足的商品及对应工厂（带缓存）
    */
   private analyzeMarketGaps(context: GameContext): Array<{
     goodsId: string;
     shortage: number;  // 缺口比例 (需求-供应)/需求
     buildingId: string | null;
   }> {
+    // 检查缓存有效性
+    if (this.marketAnalysisCache &&
+        context.currentTick - this.marketAnalysisCache.tick < this.CACHE_TTL) {
+      return this.marketAnalysisCache.gaps;
+    }
+    
     const gaps: Array<{
       goodsId: string;
       shortage: number;
@@ -1016,6 +1178,14 @@ export class AICompanyManager {
     
     // 按缺口大小排序
     gaps.sort((a, b) => b.shortage - a.shortage);
+    
+    // 更新缓存
+    if (!this.marketAnalysisCache) {
+      this.marketAnalysisCache = { tick: context.currentTick, gaps, playerDependencies: [] };
+    } else {
+      this.marketAnalysisCache.tick = context.currentTick;
+      this.marketAnalysisCache.gaps = gaps;
+    }
     
     return gaps;
   }
@@ -1051,8 +1221,25 @@ export class AICompanyManager {
       }
     }
     
-    // 查找适合购买的建筑
-    const affordableBuildings = BUILDINGS_DATA.filter(b => b.baseCost <= effectiveBudget);
+    // 查找适合购买的建筑（使用动态成本计算）
+    // 获取当前市场价格用于计算成本
+    const marketPrices: Record<string, number> = {};
+    for (const [goodsId, price] of context.marketPrices) {
+      marketPrices[goodsId] = price;
+    }
+    
+    // 计算每个建筑的真实成本并筛选
+    const buildingsWithCosts = BUILDINGS_DATA.map(b => {
+      const buildingDef = getBuildingDef(b.id);
+      if (!buildingDef) return { building: b, realCost: b.baseCost };
+      
+      const costResult = calculateConstructionCost(buildingDef, marketPrices);
+      return { building: b, realCost: costResult.totalCost };
+    });
+    
+    const affordableBuildings = buildingsWithCosts
+      .filter(item => item.realCost <= effectiveBudget)
+      .map(item => ({ ...item.building, _realCost: item.realCost }));
     
     if (affordableBuildings.length === 0) {
       console.log(`[AIManager] ${company.name} 预算${Math.floor(effectiveBudget)}不足，无可购买建筑`);
@@ -1064,15 +1251,16 @@ export class AICompanyManager {
     
     for (const gap of marketGaps) {
       if (gap.buildingId) {
-        const building = affordableBuildings.find(b => b.id === gap.buildingId);
+        const building = affordableBuildings.find(b => b.id === gap.buildingId) as (typeof affordableBuildings[number] & { _realCost?: number }) | undefined;
         if (building) {
-          console.log(`[AIManager] ${company.name} 发现市场缺口: ${gap.goodsId} 缺口${(gap.shortage * 100).toFixed(1)}%，建设 ${building.nameZh}`);
+          const realCost = building._realCost ?? building.baseCost;
+          console.log(`[AIManager] ${company.name} 发现市场缺口: ${gap.goodsId} 缺口${(gap.shortage * 100).toFixed(1)}%，建设 ${building.nameZh}，成本 ${(realCost / 10000).toFixed(0)}万`);
           return {
             tick: context.currentTick,
             type: 'purchase_building',
             description: `填补市场缺口：购买${building.nameZh}（${gap.goodsId}供应不足）`,
             targetId: building.id,
-            cost: building.baseCost,
+            cost: realCost,
           };
         }
       }
@@ -1088,14 +1276,15 @@ export class AICompanyManager {
       );
       
       if (strategicBuildings.length > 0) {
-        const selected = strategicBuildings[Math.floor(Math.random() * strategicBuildings.length)];
+        const selected = strategicBuildings[Math.floor(Math.random() * strategicBuildings.length)] as (typeof strategicBuildings[number] & { _realCost?: number }) | undefined;
         if (selected) {
+          const realCost = selected._realCost ?? selected.baseCost;
           return {
             tick: context.currentTick,
             type: 'purchase_building',
             description: `战略布局：购买${selected.nameZh}`,
             targetId: selected.id,
-            cost: selected.baseCost,
+            cost: realCost,
           };
         }
       }
@@ -1105,14 +1294,15 @@ export class AICompanyManager {
     if (company.buildings.length === 0 && config) {
       // 根据公司配置的初始建筑类型找对应建筑
       for (const initBuildingId of config.initialBuildings) {
-        const building = affordableBuildings.find(b => b.id === initBuildingId);
+        const building = affordableBuildings.find(b => b.id === initBuildingId) as (typeof affordableBuildings[number] & { _realCost?: number }) | undefined;
         if (building) {
+          const realCost = building._realCost ?? building.baseCost;
           return {
             tick: context.currentTick,
             type: 'purchase_building',
             description: `重建核心业务：购买${building.nameZh}`,
             targetId: building.id,
-            cost: building.baseCost,
+            cost: realCost,
           };
         }
       }
@@ -1159,16 +1349,19 @@ export class AICompanyManager {
     // 选择得分最高的建筑（有20%随机性避免所有AI都选同一个）
     const topCount = Math.max(1, Math.floor(scoredCandidates.length * 0.3));
     const topCandidates = scoredCandidates.slice(0, topCount);
-    const selected = topCandidates[Math.floor(Math.random() * topCandidates.length)]?.building;
+    const selectedItem = topCandidates[Math.floor(Math.random() * topCandidates.length)];
     
-    if (!selected) return null;
+    if (!selectedItem) return null;
+    
+    const selected = selectedItem.building as typeof selectedItem.building & { _realCost?: number };
+    const realCost = selected._realCost ?? selected.baseCost;
     
     return {
       tick: context.currentTick,
       type: 'purchase_building',
       description: `购买${selected.nameZh}`,
       targetId: selected.id,
-      cost: selected.baseCost,
+      cost: realCost,
     };
   }
   
@@ -1256,9 +1449,16 @@ export class AICompanyManager {
   }
   
   /**
-   * 分析玩家依赖
+   * 分析玩家依赖（带缓存）
    */
   private analyzePlayerDependencies(context: GameContext): string[] {
+    // 检查缓存有效性
+    if (this.marketAnalysisCache &&
+        context.currentTick - this.marketAnalysisCache.tick < this.CACHE_TTL &&
+        this.marketAnalysisCache.playerDependencies.length > 0) {
+      return this.marketAnalysisCache.playerDependencies;
+    }
+    
     const dependencies: Map<string, number> = new Map();
     
     for (const building of context.playerBuildings) {
@@ -1277,10 +1477,17 @@ export class AICompanyManager {
     }
     
     // 按依赖量排序
-    return Array.from(dependencies.entries())
+    const result = Array.from(dependencies.entries())
       .sort((a, b) => b[1] - a[1])
       .slice(0, 3)
       .map(([goodsId]) => goodsId);
+    
+    // 更新缓存
+    if (this.marketAnalysisCache) {
+      this.marketAnalysisCache.playerDependencies = result;
+    }
+    
+    return result;
   }
   
   /**
@@ -1322,7 +1529,11 @@ export class AICompanyManager {
   }
   
   /**
-   * 执行购买建筑
+   * 执行购买建筑（支持建造系统）
+   * AI公司购买建筑时：
+   * 1. 检查并消耗建筑材料
+   * 2. 设置建筑为 under_construction 状态
+   * 3. 建造完成后才能生产
    */
   private executePurchaseBuilding(
     company: AICompanyState,
@@ -1335,13 +1546,88 @@ export class AICompanyManager {
     const def = BUILDINGS_DATA.find(b => b.id === action.targetId);
     if (!def) return;
     
+    // 获取建筑定义（用于建造系统）
+    const buildingDef = getBuildingDef(action.targetId);
+    if (!buildingDef) return;
+    
+    // 获取建造材料需求
+    const constructionMaterials = getConstructionMaterials(buildingDef);
+    const constructionTime = getConstructionTime(buildingDef);
+    
+    // 检查是否有足够的建筑材料
+    const inventory = inventoryManager.getInventory(company.id);
+    if (!inventory) return;
+    
+    // AI公司对材料要求更宽松 - 只需要50%的材料即可开始建造
+    // 这模拟AI公司有更多渠道获取材料
+    const materialMultiplier = 0.5;
+    let hasAllMaterials = true;
+    const missingMaterials: string[] = [];
+    
+    for (const material of constructionMaterials) {
+      const stock = inventory.stocks[material.goodsId];
+      const available = stock ? stock.quantity - stock.reservedForSale - stock.reservedForProduction : 0;
+      const requiredAmount = Math.ceil(material.amount * materialMultiplier);
+      
+      if (available < requiredAmount) {
+        hasAllMaterials = false;
+        missingMaterials.push(material.goodsId);
+      }
+    }
+    
+    // 如果缺少材料，尝试在市场上采购
+    if (!hasAllMaterials) {
+      console.log(`[AIManager] ${company.name} 缺少建筑材料 [${missingMaterials.join(', ')}]，尝试市场采购`);
+      
+      // 为缺少的材料下单采购
+      for (const goodsId of missingMaterials) {
+        const material = constructionMaterials.find(m => m.goodsId === goodsId);
+        if (!material) continue;
+        
+        const requiredAmount = Math.ceil(material.amount * materialMultiplier);
+        const marketPrice = priceDiscoveryService.getPrice(goodsId);
+        const buyPrice = marketPrice * 1.05; // 愿意高于市价5%采购
+        
+        // 检查资金是否足够
+        if (company.cash >= buyPrice * requiredAmount) {
+          marketOrderBook.submitBuyOrder(
+            company.id,
+            goodsId,
+            requiredAmount,
+            buyPrice,
+            context.currentTick,
+            50 // 50 tick过期
+          );
+        }
+      }
+      
+      // 材料不足时，AI公司仍然可以开始建造（模拟分期供货）
+      // 但建造时间会延长
+    }
+    
+    // 扣除建筑成本
     company.cash -= action.cost;
+    
+    // 消耗可用的建筑材料
+    for (const material of constructionMaterials) {
+      const requiredAmount = Math.ceil(material.amount * materialMultiplier);
+      const stock = inventory.stocks[material.goodsId];
+      const available = stock ? stock.quantity - stock.reservedForSale - stock.reservedForProduction : 0;
+      const consumeAmount = Math.min(available, requiredAmount);
+      
+      if (consumeAmount > 0) {
+        inventoryManager.consumeGoods(company.id, material.goodsId, consumeAmount, context.currentTick, 'construction');
+      }
+    }
     
     const defaultSlot = def.productionSlots[0];
     const defaultMethodId = defaultSlot?.defaultMethodId ?? defaultSlot?.methods[0]?.id ?? '';
     
     // 获取公司现有建筑的聚合因子（保持一致）
     const existingAggregatedCount = company.buildings[0]?.aggregatedCount ?? 1;
+    
+    // 计算实际建造时间（如果材料不足，时间延长50%）
+    const actualConstructionTime = hasAllMaterials ? constructionTime : Math.ceil(constructionTime * 1.5);
     
     const newBuilding: BuildingInstance = {
       id: `${company.id}-building-${company.buildings.length}-${Date.now()}`,
@@ -1353,18 +1639,21 @@ export class AICompanyManager {
       },
       efficiency: 0.9 + Math.random() * 0.1,
       utilization: 0.8 + Math.random() * 0.2,
-      status: 'running',
+      status: 'under_construction', // 建造中状态
       productionProgress: 0,
       currentMethodId: defaultMethodId,
-      aggregatedCount: existingAggregatedCount, // 继承公司的聚合因子
+      aggregatedCount: existingAggregatedCount,
+      constructionProgress: 0,
+      constructionTimeRequired: actualConstructionTime,
     };
     
     company.buildings.push(newBuilding);
     
     // 生成新闻
+    // 注意：1 tick = 1 day，actualConstructionTime 已经是天数
     this.pendingNews.push({
       companyId: company.id,
-      headline: `${company.name}斥资扩张，新建${def.nameZh}`,
+      headline: `${company.name}动工新建${def.nameZh}，预计${actualConstructionTime}天完工`,
     });
     
     // 生成竞争事件
@@ -1374,12 +1663,12 @@ export class AICompanyManager {
       type: 'expansion',
       companyId: company.id,
       companyName: company.name,
-      title: `${company.name}扩张产能`,
-      description: `${company.name}投资新建${def.nameZh}，进一步扩大其在${def.category}领域的影响力。`,
+      title: `${company.name}开工建设`,
+      description: `${company.name}投资新建${def.nameZh}，工程预计${actualConstructionTime}天完成。`,
       severity: 'moderate',
     });
     
-    console.log(`[AIManager] ${company.name} 购买了 ${def.nameZh}`);
+    console.log(`[AIManager] ${company.name} 开始建造 ${def.nameZh}，需要${actualConstructionTime}天`);
   }
   
   /**
@@ -1464,19 +1753,49 @@ export class AICompanyManager {
   }
   
   /**
-   * 处理AI公司生产（使用真实库存系统）
+   * 处理AI公司生产（使用真实库存系统，支持建造系统）
    * 产量和消耗都会乘以聚合因子
    */
   private processCompanyProduction(company: AICompanyState, context: GameContext): void {
-    const TICKS_PER_MONTH = 720;
+    // 1 tick = 1 day, 1 month = 30 days = 30 ticks
+    const TICKS_PER_MONTH = 30;
     const inventory = inventoryManager.getInventory(company.id);
     if (!inventory) return;
     
     for (const building of company.buildings) {
-      if (building.status !== 'running') continue;
-      
       const def = BUILDINGS_DATA.find(b => b.id === building.definitionId);
       if (!def) continue;
+      
+      // 处理建造中的建筑
+      if (building.status === 'under_construction') {
+        // 获取建造所需时间
+        const constructionTimeRequired = building.constructionTimeRequired ??
+          (getBuildingDef(building.definitionId) ? getConstructionTime(getBuildingDef(building.definitionId)!) : 72);
+        
+        // 推进建造进度
+        building.constructionProgress = (building.constructionProgress ?? 0) + 1;
+        
+        // 检查是否建造完成
+        if (building.constructionProgress >= constructionTimeRequired) {
+          building.status = 'running';
+          // 使用 delete 操作符清理建造相关属性
+          delete building.constructionProgress;
+          delete building.constructionTimeRequired;
+          
+          console.log(`[AIManager] ${company.name} 的 ${building.name} 建造完成，开始运营`);
+          
+          // 生成建造完成新闻
+          this.pendingNews.push({
+            companyId: company.id,
+            headline: `${company.name}的${building.name}竣工投产`,
+          });
+        }
+        
+        continue; // 建造中的建筑不生产
+      }
+      
+      // 只有 running 状态的建筑才能生产
+      if (building.status !== 'running') continue;
       
       const slot = def.productionSlots[0];
       const method = slot?.methods.find(m => m.id === building.currentMethodId) ?? slot?.methods[0];
@@ -1536,10 +1855,25 @@ export class AICompanyManager {
       company.cash = latestInventory.cash;
     }
     
-    // 防止破产（AI公司获得救济）
+    // 防止破产（AI公司获得救济）- 根据公司规模给予更多救济金
     if (company.cash < 0) {
-      inventoryManager.addCash(company.id, 10_000_000, context.currentTick, 'bailout');
-      company.cash = 10_000_000;
+      // 根据公司建筑数量和聚合因子计算救济金
+      // 建筑越多、规模越大的公司需要更多资金维持运营
+      let bailoutAmount = 100_000_000; // 基础1亿
+      
+      // 根据建筑数量增加（每个建筑额外2000万）
+      bailoutAmount += company.buildings.length * 20_000_000;
+      
+      // 根据聚合因子增加（大公司需要更多资金）
+      const maxAggregation = Math.max(1, ...company.buildings.map(b => b.aggregatedCount ?? 1));
+      bailoutAmount += (maxAggregation - 1) * 30_000_000; // 每级聚合额外3000万
+      
+      // 上限3亿
+      bailoutAmount = Math.min(bailoutAmount, 300_000_000);
+      
+      inventoryManager.addCash(company.id, bailoutAmount, context.currentTick, 'bailout');
+      company.cash = bailoutAmount;
+      console.log(`[AIManager] ${company.name} 获得救济金 ${(bailoutAmount / 1_000_000).toFixed(0)}M`);
     }
   }
   

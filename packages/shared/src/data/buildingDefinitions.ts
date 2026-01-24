@@ -48,6 +48,14 @@ export interface ProductionSlotDefinition {
 }
 
 /**
+ * 建造材料需求
+ */
+export interface ConstructionMaterial {
+  goodsId: string;
+  amount: number;
+}
+
+/**
  * 建筑定义（数据配置格式）
  * 注意：与 types/production.ts 中的 BuildingDefinition 不同
  * 这个接口用于声明式配置，不需要所有运行时属性
@@ -60,12 +68,173 @@ export interface BuildingDef {
   description?: string;
   icon: string;
   size: 'small' | 'medium' | 'large' | 'huge';
+  /** @deprecated 使用 calculateConstructionCost 动态计算成本 */
   baseCost: number;
   maintenanceCost: number;
   maxWorkers: number;
   productionSlots: ProductionSlotDefinition[];
   /** 使用的模板ID（可选，用于自动派生某些属性）*/
   templateId?: string;
+  /** 建造所需时间（ticks，1 tick = 1天）- 如未指定则根据size自动派生 */
+  constructionTime?: number;
+  /** 建造所需材料 - 必须指定，定义真实的材料需求 */
+  constructionMaterials?: ConstructionMaterial[];
+  /** 劳动力复杂度因子 - 影响人工成本，默认根据category自动派生 */
+  laborComplexityFactor?: number;
+}
+
+// ============ 建造系统配置 ============
+
+/**
+ * 根据建筑规模的默认建造时间（ticks，1 tick = 1天）
+ *
+ * 现实建造时间参考：
+ * - 小型建筑（便利店、加油站）: 1-2个月
+ * - 中型建筑（工厂、仓库）: 3-6个月
+ * - 大型建筑（钢铁厂、化工厂）: 6-12个月
+ * - 巨型建筑（芯片厂、炼油厂）: 1-3年
+ *
+ * 游戏中为了平衡性适当缩短，但保持相对比例
+ */
+export const CONSTRUCTION_TIME_BY_SIZE: Record<BuildingDef['size'], number> = {
+  small: 30,    // 30天 (约1个月) - 便利店、小型零售店
+  medium: 75,   // 75天 (约2.5个月) - 中型工厂、仓库
+  large: 150,   // 150天 (约5个月) - 大型工厂、炼钢厂
+  huge: 300,    // 300天 (约10个月) - 芯片厂、炼油厂、汽车工厂
+};
+
+/**
+ * 根据建筑规模的劳动力成本系数
+ */
+export const LABOR_SIZE_FACTOR: Record<BuildingDef['size'], number> = {
+  small: 0.5,
+  medium: 1.0,
+  large: 2.0,
+  huge: 4.0,
+};
+
+/**
+ * 根据建筑类别的劳动力复杂度系数
+ */
+export const LABOR_CATEGORY_FACTOR: Record<string, number> = {
+  extraction: 1.0,      // 资源开采 - 基础难度
+  agriculture: 0.6,     // 农业 - 较低难度
+  processing: 1.5,      // 加工 - 中等难度
+  manufacturing: 2.5,   // 制造 - 高难度
+  service: 2.0,         // 服务 - 中高难度
+  retail: 0.8,          // 零售 - 较低难度
+};
+
+/**
+ * 基础人工成本（单位：分，100万 = 1000000分 = 1万元）
+ */
+export const BASE_LABOR_COST = 1000000; // 100万元
+
+/**
+ * 根据建筑规模的默认建造材料（仅作为后备，实际应使用每个建筑的自定义配置）
+ */
+export const CONSTRUCTION_MATERIALS_BY_SIZE: Record<BuildingDef['size'], ConstructionMaterial[]> = {
+  small: [
+    { goodsId: 'cement', amount: 100 },
+    { goodsId: 'steel', amount: 50 },
+  ],
+  medium: [
+    { goodsId: 'cement', amount: 300 },
+    { goodsId: 'steel', amount: 150 },
+    { goodsId: 'glass', amount: 100 },
+  ],
+  large: [
+    { goodsId: 'cement', amount: 600 },
+    { goodsId: 'steel', amount: 300 },
+    { goodsId: 'glass', amount: 200 },
+    { goodsId: 'aluminum', amount: 100 },
+  ],
+  huge: [
+    { goodsId: 'cement', amount: 1200 },
+    { goodsId: 'steel', amount: 600 },
+    { goodsId: 'glass', amount: 400 },
+    { goodsId: 'aluminum', amount: 200 },
+  ],
+};
+
+/**
+ * 获取建筑的建造时间（优先使用自定义值，否则使用规模默认值）
+ */
+export function getConstructionTime(building: BuildingDef): number {
+  return building.constructionTime ?? CONSTRUCTION_TIME_BY_SIZE[building.size];
+}
+
+/**
+ * 获取建筑的建造材料需求（优先使用自定义值，否则使用规模默认值）
+ */
+export function getConstructionMaterials(building: BuildingDef): ConstructionMaterial[] {
+  return building.constructionMaterials ?? CONSTRUCTION_MATERIALS_BY_SIZE[building.size];
+}
+
+/**
+ * 计算建筑的劳动力成本
+ * 公式: baseLaborCost × sizeFactor × complexityFactor
+ */
+export function calculateLaborCost(building: BuildingDef): number {
+  const sizeFactor = LABOR_SIZE_FACTOR[building.size];
+  const complexityFactor = building.laborComplexityFactor ?? LABOR_CATEGORY_FACTOR[building.category] ?? 1.0;
+  return Math.round(BASE_LABOR_COST * sizeFactor * complexityFactor);
+}
+
+/**
+ * 建造成本计算结果
+ */
+export interface ConstructionCostResult {
+  /** 材料总成本（分） */
+  materialCost: number;
+  /** 人工成本（分） */
+  laborCost: number;
+  /** 总成本（分） */
+  totalCost: number;
+  /** 材料明细 */
+  materialDetails: Array<{
+    goodsId: string;
+    amount: number;
+    unitPrice: number;
+    subtotal: number;
+  }>;
+}
+
+/**
+ * 计算建筑的建造总成本
+ * @param building 建筑定义
+ * @param marketPrices 市场价格表（goodsId => 单价，单位：分）
+ * @returns 建造成本详情
+ */
+export function calculateConstructionCost(
+  building: BuildingDef,
+  marketPrices: Record<string, number>
+): ConstructionCostResult {
+  const materials = getConstructionMaterials(building);
+  const materialDetails: ConstructionCostResult['materialDetails'] = [];
+  let materialCost = 0;
+
+  for (const mat of materials) {
+    const unitPrice = marketPrices[mat.goodsId] ?? 0;
+    const subtotal = Math.round(mat.amount * unitPrice);
+    materialDetails.push({
+      goodsId: mat.goodsId,
+      amount: mat.amount,
+      unitPrice,
+      subtotal,
+    });
+    materialCost += subtotal;
+  }
+
+  const laborCost = calculateLaborCost(building);
+  const totalCost = materialCost + laborCost;
+
+  return {
+    materialCost,
+    laborCost,
+    totalCost,
+    materialDetails,
+  };
 }
 
 // ============ 建筑定义配置 ============
@@ -89,6 +258,14 @@ export const BUILDING_DEFINITIONS: Record<string, BuildingDef> = {
     maintenanceCost: 100000,
     maxWorkers: 200,
     templateId: 'EXTRACTION',
+    constructionMaterials: [
+      { goodsId: 'cement', amount: 2000 },      // 矿井巷道加固
+      { goodsId: 'steel', amount: 1500 },       // 矿井支撑、提升设备
+      { goodsId: 'mechanical-parts', amount: 200 }, // 采矿机械
+      { goodsId: 'electric-motor', amount: 20 }, // 提升机、传送带
+      { goodsId: 'copper', amount: 100 },       // 电气布线
+      { goodsId: 'glass', amount: 50 },         // 控制室
+    ],
     productionSlots: [
       {
         type: 'process',
@@ -154,6 +331,14 @@ export const BUILDING_DEFINITIONS: Record<string, BuildingDef> = {
     maintenanceCost: 120000,
     maxWorkers: 180,
     templateId: 'EXTRACTION',
+    constructionMaterials: [
+      { goodsId: 'cement', amount: 2000 },
+      { goodsId: 'steel', amount: 1500 },
+      { goodsId: 'mechanical-parts', amount: 200 },
+      { goodsId: 'electric-motor', amount: 20 },
+      { goodsId: 'copper', amount: 100 },
+      { goodsId: 'glass', amount: 50 },
+    ],
     productionSlots: [
       {
         type: 'process',
@@ -205,6 +390,13 @@ export const BUILDING_DEFINITIONS: Record<string, BuildingDef> = {
     maintenanceCost: 500000,
     maxWorkers: 150,
     templateId: 'EXTRACTION',
+    constructionMaterials: [
+      { goodsId: 'cement', amount: 800 },       // 特殊防腐蚀结构
+      { goodsId: 'steel', amount: 600 },        // 耐腐蚀钢材
+      { goodsId: 'chemicals', amount: 200 },    // 分离提取设备
+      { goodsId: 'mechanical-parts', amount: 150 },
+      { goodsId: 'sensors', amount: 50 },       // 精密检测设备
+    ],
     productionSlots: [
       {
         type: 'process',
@@ -242,6 +434,14 @@ export const BUILDING_DEFINITIONS: Record<string, BuildingDef> = {
     maintenanceCost: 800000,
     maxWorkers: 300,
     templateId: 'EXTRACTION',
+    constructionMaterials: [
+      { goodsId: 'cement', amount: 4000 },      // 钻井平台基础
+      { goodsId: 'steel', amount: 3000 },       // 钻塔、管道
+      { goodsId: 'mechanical-parts', amount: 400 }, // 钻井设备
+      { goodsId: 'copper', amount: 200 },       // 电气系统
+      { goodsId: 'sensors', amount: 100 },      // 监测系统
+      { goodsId: 'chemicals', amount: 150 },    // 钻井液
+    ],
     productionSlots: [
       {
         type: 'process',
@@ -293,6 +493,12 @@ export const BUILDING_DEFINITIONS: Record<string, BuildingDef> = {
     maintenanceCost: 80000,
     maxWorkers: 250,
     templateId: 'EXTRACTION',
+    constructionMaterials: [
+      { goodsId: 'cement', amount: 1500 },      // 巷道支护
+      { goodsId: 'steel', amount: 1200 },       // 支撑结构
+      { goodsId: 'mechanical-parts', amount: 150 }, // 采煤机械
+      { goodsId: 'electric-motor', amount: 15 }, // 传送带电机
+    ],
     productionSlots: [
       {
         type: 'process',
@@ -344,6 +550,12 @@ export const BUILDING_DEFINITIONS: Record<string, BuildingDef> = {
     maintenanceCost: 400000,
     maxWorkers: 120,
     templateId: 'EXTRACTION',
+    constructionMaterials: [
+      { goodsId: 'cement', amount: 1000 },      // 蒸发池基础
+      { goodsId: 'steel', amount: 800 },        // 管道系统
+      { goodsId: 'chemicals', amount: 200 },    // 提锂化学品
+      { goodsId: 'mechanical-parts', amount: 100 },
+    ],
     productionSlots: [
       {
         type: 'process',
@@ -381,6 +593,12 @@ export const BUILDING_DEFINITIONS: Record<string, BuildingDef> = {
     maintenanceCost: 250000,
     maxWorkers: 150,
     templateId: 'EXTRACTION',
+    constructionMaterials: [
+      { goodsId: 'cement', amount: 1500 },      // 井口基础
+      { goodsId: 'steel', amount: 1200 },       // 管道、井架
+      { goodsId: 'mechanical-parts', amount: 150 }, // 压缩设备
+      { goodsId: 'sensors', amount: 80 },       // 压力监测
+    ],
     productionSlots: [
       {
         type: 'process',
@@ -432,6 +650,11 @@ export const BUILDING_DEFINITIONS: Record<string, BuildingDef> = {
     maintenanceCost: 60000,
     maxWorkers: 100,
     templateId: 'EXTRACTION',
+    constructionMaterials: [
+      { goodsId: 'cement', amount: 500 },       // 简单基础设施
+      { goodsId: 'steel', amount: 400 },        // 筛分设备
+      { goodsId: 'mechanical-parts', amount: 80 }, // 挖掘机械
+    ],
     productionSlots: [
       {
         type: 'process',
@@ -483,6 +706,12 @@ export const BUILDING_DEFINITIONS: Record<string, BuildingDef> = {
     maintenanceCost: 140000,
     maxWorkers: 200,
     templateId: 'EXTRACTION',
+    constructionMaterials: [
+      { goodsId: 'cement', amount: 1800 },      // 露天矿基础
+      { goodsId: 'steel', amount: 1400 },       // 挖掘设备
+      { goodsId: 'mechanical-parts', amount: 180 },
+      { goodsId: 'electric-motor', amount: 18 },
+    ],
     productionSlots: [
       {
         type: 'process',
@@ -534,6 +763,11 @@ export const BUILDING_DEFINITIONS: Record<string, BuildingDef> = {
     maintenanceCost: 120000,
     maxWorkers: 150,
     templateId: 'AGRICULTURE',
+    constructionMaterials: [
+      { goodsId: 'cement', amount: 600 },       // 仓库、道路
+      { goodsId: 'glass', amount: 200 },        // 育苗温室
+      { goodsId: 'aluminum', amount: 50 },      // 灌溉系统
+    ],
     productionSlots: [
       {
         type: 'process',
@@ -587,6 +821,14 @@ export const BUILDING_DEFINITIONS: Record<string, BuildingDef> = {
     maintenanceCost: 500000,
     maxWorkers: 500,
     templateId: 'PROCESSING',
+    constructionMaterials: [
+      { goodsId: 'cement', amount: 8000 },      // 高炉基础
+      { goodsId: 'steel', amount: 500 },        // 初始钢材（引导阶段）
+      { goodsId: 'copper', amount: 400 },       // 电气系统
+      { goodsId: 'mechanical-parts', amount: 500 }, // 轧钢机械
+      { goodsId: 'electric-motor', amount: 40 }, // 大型电机
+      { goodsId: 'sensors', amount: 100 },      // 温控监测
+    ],
     productionSlots: [
       {
         type: 'process',
@@ -644,6 +886,14 @@ export const BUILDING_DEFINITIONS: Record<string, BuildingDef> = {
     maintenanceCost: 1000000,
     maxWorkers: 400,
     templateId: 'PROCESSING',
+    constructionMaterials: [
+      { goodsId: 'cement', amount: 10000 },     // 储罐基础
+      { goodsId: 'steel', amount: 8000 },       // 蒸馏塔、管道
+      { goodsId: 'copper', amount: 500 },       // 电气系统
+      { goodsId: 'mechanical-parts', amount: 600 }, // 泵、阀门
+      { goodsId: 'sensors', amount: 200 },      // 安全监控
+      { goodsId: 'chemicals', amount: 300 },    // 催化剂
+    ],
     productionSlots: [
       {
         type: 'process',
@@ -704,6 +954,13 @@ export const BUILDING_DEFINITIONS: Record<string, BuildingDef> = {
     maintenanceCost: 250000,
     maxWorkers: 200,
     templateId: 'PROCESSING',
+    constructionMaterials: [
+      { goodsId: 'cement', amount: 3000 },      // 电解槽基础
+      { goodsId: 'steel', amount: 2000 },       // 结构框架
+      { goodsId: 'copper', amount: 300 },       // 电极、电缆
+      { goodsId: 'chemicals', amount: 200 },    // 电解液
+      { goodsId: 'mechanical-parts', amount: 200 },
+    ],
     productionSlots: [
       {
         type: 'process',
@@ -741,6 +998,14 @@ export const BUILDING_DEFINITIONS: Record<string, BuildingDef> = {
     maintenanceCost: 600000,
     maxWorkers: 300,
     templateId: 'PROCESSING',
+    constructionMaterials: [
+      { goodsId: 'cement', amount: 2500 },      // 洁净室基础
+      { goodsId: 'steel', amount: 1500 },       // 结构框架
+      { goodsId: 'glass', amount: 400 },        // 洁净室隔断
+      { goodsId: 'aluminum', amount: 300 },     // 洁净室系统
+      { goodsId: 'sensors', amount: 150 },      // 环境监控
+      { goodsId: 'pcb', amount: 50 },           // 控制系统
+    ],
     productionSlots: [
       {
         type: 'process',
@@ -781,6 +1046,13 @@ export const BUILDING_DEFINITIONS: Record<string, BuildingDef> = {
     maintenanceCost: 400000,
     maxWorkers: 250,
     templateId: 'PROCESSING',
+    constructionMaterials: [
+      { goodsId: 'cement', amount: 3000 },      // 反应釜基础
+      { goodsId: 'steel', amount: 2500 },       // 耐腐蚀容器
+      { goodsId: 'copper', amount: 200 },       // 管道
+      { goodsId: 'mechanical-parts', amount: 250 },
+      { goodsId: 'sensors', amount: 120 },      // 安全监控
+    ],
     productionSlots: [
       {
         type: 'process',
@@ -821,6 +1093,13 @@ export const BUILDING_DEFINITIONS: Record<string, BuildingDef> = {
     maintenanceCost: 400000,
     maxWorkers: 300,
     templateId: 'PROCESSING',
+    constructionMaterials: [
+      { goodsId: 'cement', amount: 4000 },      // 电解槽基础
+      { goodsId: 'steel', amount: 3000 },       // 结构框架
+      { goodsId: 'copper', amount: 500 },       // 大功率电缆
+      { goodsId: 'mechanical-parts', amount: 300 },
+      { goodsId: 'electric-motor', amount: 30 },
+    ],
     productionSlots: [
       {
         type: 'process',
@@ -878,6 +1157,12 @@ export const BUILDING_DEFINITIONS: Record<string, BuildingDef> = {
     maintenanceCost: 180000,
     maxWorkers: 200,
     templateId: 'PROCESSING',
+    constructionMaterials: [
+      { goodsId: 'cement', amount: 1500 },      // 熔炉基础
+      { goodsId: 'steel', amount: 1000 },       // 结构框架
+      { goodsId: 'mechanical-parts', amount: 150 },
+      { goodsId: 'sensors', amount: 60 },       // 温控系统
+    ],
     productionSlots: [
       {
         type: 'process',
@@ -935,6 +1220,12 @@ export const BUILDING_DEFINITIONS: Record<string, BuildingDef> = {
     maintenanceCost: 200000,
     maxWorkers: 250,
     templateId: 'PROCESSING',
+    constructionMaterials: [
+      { goodsId: 'steel', amount: 3000 },       // 回转窑结构
+      { goodsId: 'mechanical-parts', amount: 300 }, // 研磨设备
+      { goodsId: 'electric-motor', amount: 25 }, // 驱动电机
+      { goodsId: 'copper', amount: 150 },       // 电气系统
+    ],
     productionSlots: [
       {
         type: 'process',
@@ -993,6 +1284,12 @@ export const BUILDING_DEFINITIONS: Record<string, BuildingDef> = {
     maintenanceCost: 280000,
     maxWorkers: 300,
     templateId: 'PROCESSING',
+    constructionMaterials: [
+      { goodsId: 'cement', amount: 2500 },      // 厂房基础
+      { goodsId: 'steel', amount: 2000 },       // 注塑机框架
+      { goodsId: 'mechanical-parts', amount: 250 },
+      { goodsId: 'electric-motor', amount: 20 },
+    ],
     productionSlots: [
       {
         type: 'process',
@@ -1069,6 +1366,16 @@ export const BUILDING_DEFINITIONS: Record<string, BuildingDef> = {
     maintenanceCost: 5000000,
     maxWorkers: 1000,
     templateId: 'MANUFACTURING',
+    constructionMaterials: [
+      { goodsId: 'cement', amount: 15000 },     // 超大洁净室基础
+      { goodsId: 'steel', amount: 10000 },      // 结构框架
+      { goodsId: 'glass', amount: 2000 },       // 洁净室隔断
+      { goodsId: 'aluminum', amount: 1500 },    // 洁净室系统
+      { goodsId: 'copper', amount: 1000 },      // 电气系统
+      { goodsId: 'sensors', amount: 500 },      // 环境监控
+      { goodsId: 'pcb', amount: 200 },          // 控制系统
+      { goodsId: 'semiconductor-chip', amount: 100 }, // 自动化控制
+    ],
     productionSlots: [
       {
         type: 'process',
@@ -1129,6 +1436,14 @@ export const BUILDING_DEFINITIONS: Record<string, BuildingDef> = {
     maintenanceCost: 1000000,
     maxWorkers: 400,
     templateId: 'MANUFACTURING',
+    constructionMaterials: [
+      { goodsId: 'cement', amount: 4000 },      // 厂房基础
+      { goodsId: 'steel', amount: 3000 },       // 结构框架
+      { goodsId: 'aluminum', amount: 500 },     // 洁净环境
+      { goodsId: 'copper', amount: 400 },       // 电气系统
+      { goodsId: 'mechanical-parts', amount: 300 }, // 自动化设备
+      { goodsId: 'sensors', amount: 150 },      // 质量监控
+    ],
     productionSlots: [
       {
         type: 'process',
@@ -1189,6 +1504,16 @@ export const BUILDING_DEFINITIONS: Record<string, BuildingDef> = {
     maintenanceCost: 3000000,
     maxWorkers: 2000,
     templateId: 'MANUFACTURING',
+    constructionMaterials: [
+      { goodsId: 'cement', amount: 12000 },     // 巨型厂房基础
+      { goodsId: 'steel', amount: 8000 },       // 结构框架
+      { goodsId: 'aluminum', amount: 1000 },    // 轻量化结构
+      { goodsId: 'copper', amount: 600 },       // 电气系统
+      { goodsId: 'mechanical-parts', amount: 800 }, // 生产线设备
+      { goodsId: 'electric-motor', amount: 60 }, // 机器人
+      { goodsId: 'sensors', amount: 300 },      // 自动化监控
+      { goodsId: 'pcb', amount: 100 },          // 控制系统
+    ],
     productionSlots: [
       {
         type: 'process',
@@ -1255,6 +1580,15 @@ export const BUILDING_DEFINITIONS: Record<string, BuildingDef> = {
     maintenanceCost: 800000,
     maxWorkers: 600,
     templateId: 'MANUFACTURING',
+    constructionMaterials: [
+      { goodsId: 'cement', amount: 3000 },      // 厂房基础
+      { goodsId: 'steel', amount: 2000 },       // 结构框架
+      { goodsId: 'glass', amount: 500 },        // 洁净室
+      { goodsId: 'aluminum', amount: 400 },     // 洁净环境
+      { goodsId: 'copper', amount: 300 },       // 电气系统
+      { goodsId: 'mechanical-parts', amount: 250 }, // 组装线
+      { goodsId: 'sensors', amount: 100 },      // 质量检测
+    ],
     productionSlots: [
       {
         type: 'process',
@@ -1339,6 +1673,15 @@ export const BUILDING_DEFINITIONS: Record<string, BuildingDef> = {
     maintenanceCost: 2000000,
     maxWorkers: 500,
     templateId: 'MANUFACTURING',
+    constructionMaterials: [
+      { goodsId: 'cement', amount: 10000 },     // 超大洁净室基础
+      { goodsId: 'steel', amount: 6000 },       // 结构框架
+      { goodsId: 'glass', amount: 1500 },       // 洁净室
+      { goodsId: 'aluminum', amount: 1000 },    // 洁净系统
+      { goodsId: 'copper', amount: 500 },       // 电气系统
+      { goodsId: 'chemicals', amount: 300 },    // 初始化学品
+      { goodsId: 'sensors', amount: 250 },      // 精密监控
+    ],
     productionSlots: [
       {
         type: 'process',
@@ -1399,6 +1742,14 @@ export const BUILDING_DEFINITIONS: Record<string, BuildingDef> = {
     maintenanceCost: 600000,
     maxWorkers: 300,
     templateId: 'MANUFACTURING',
+    constructionMaterials: [
+      { goodsId: 'cement', amount: 2500 },      // 厂房基础
+      { goodsId: 'steel', amount: 1800 },       // 结构框架
+      { goodsId: 'aluminum', amount: 400 },     // 洁净环境
+      { goodsId: 'copper', amount: 300 },       // 电气系统
+      { goodsId: 'mechanical-parts', amount: 200 }, // 组装线
+      { goodsId: 'sensors', amount: 120 },      // 安全监控
+    ],
     productionSlots: [
       {
         type: 'process',
@@ -1459,6 +1810,14 @@ export const BUILDING_DEFINITIONS: Record<string, BuildingDef> = {
     maintenanceCost: 450000,
     maxWorkers: 350,
     templateId: 'MANUFACTURING',
+    constructionMaterials: [
+      { goodsId: 'cement', amount: 2000 },      // 厂房基础
+      { goodsId: 'steel', amount: 1500 },       // 结构框架
+      { goodsId: 'glass', amount: 300 },        // 洁净区域
+      { goodsId: 'copper', amount: 400 },       // 电镀设备用
+      { goodsId: 'chemicals', amount: 200 },    // 化学处理
+      { goodsId: 'mechanical-parts', amount: 180 },
+    ],
     productionSlots: [
       {
         type: 'process',
@@ -1518,6 +1877,14 @@ export const BUILDING_DEFINITIONS: Record<string, BuildingDef> = {
     maintenanceCost: 900000,
     maxWorkers: 600,
     templateId: 'MANUFACTURING',
+    constructionMaterials: [
+      { goodsId: 'cement', amount: 6000 },      // 重型厂房基础
+      { goodsId: 'steel', amount: 5000 },       // 结构框架
+      { goodsId: 'aluminum', amount: 500 },     // 轻量化结构
+      { goodsId: 'copper', amount: 350 },       // 电气系统
+      { goodsId: 'mechanical-parts', amount: 500 }, // 机加工设备
+      { goodsId: 'electric-motor', amount: 50 }, // 大型机床
+    ],
     productionSlots: [
       {
         type: 'process',
@@ -1578,6 +1945,13 @@ export const BUILDING_DEFINITIONS: Record<string, BuildingDef> = {
     maintenanceCost: 500000,
     maxWorkers: 400,
     templateId: 'MANUFACTURING',
+    constructionMaterials: [
+      { goodsId: 'cement', amount: 3000 },      // 厂房基础
+      { goodsId: 'steel', amount: 2500 },       // 结构框架
+      { goodsId: 'copper', amount: 500 },       // 绕线设备
+      { goodsId: 'mechanical-parts', amount: 300 }, // 加工设备
+      { goodsId: 'electric-motor', amount: 30 }, // 测试设备
+    ],
     productionSlots: [
       {
         type: 'process',
@@ -1637,6 +2011,13 @@ export const BUILDING_DEFINITIONS: Record<string, BuildingDef> = {
     maintenanceCost: 280000,
     maxWorkers: 350,
     templateId: 'MANUFACTURING',
+    constructionMaterials: [
+      { goodsId: 'cement', amount: 2500 },      // 厂房基础
+      { goodsId: 'steel', amount: 2000 },       // 结构框架
+      { goodsId: 'copper', amount: 200 },       // 电气系统
+      { goodsId: 'mechanical-parts', amount: 200 }, // CNC机床
+      { goodsId: 'electric-motor', amount: 25 }, // 驱动电机
+    ],
     productionSlots: [
       {
         type: 'process',
@@ -1695,6 +2076,14 @@ export const BUILDING_DEFINITIONS: Record<string, BuildingDef> = {
     maintenanceCost: 450000,
     maxWorkers: 500,
     templateId: 'MANUFACTURING',
+    constructionMaterials: [
+      { goodsId: 'cement', amount: 3000 },      // 厂房基础
+      { goodsId: 'steel', amount: 2500 },       // 结构框架
+      { goodsId: 'aluminum', amount: 300 },     // 轻量化结构
+      { goodsId: 'copper', amount: 250 },       // 电气系统
+      { goodsId: 'mechanical-parts', amount: 300 }, // 生产设备
+      { goodsId: 'rubber', amount: 100 },       // 密封材料
+    ],
     productionSlots: [
       {
         type: 'process',
@@ -1755,6 +2144,14 @@ export const BUILDING_DEFINITIONS: Record<string, BuildingDef> = {
     maintenanceCost: 700000,
     maxWorkers: 300,
     templateId: 'MANUFACTURING',
+    constructionMaterials: [
+      { goodsId: 'cement', amount: 1500 },      // 洁净室基础
+      { goodsId: 'steel', amount: 1000 },       // 结构框架
+      { goodsId: 'glass', amount: 400 },        // 洁净室
+      { goodsId: 'aluminum', amount: 300 },     // 洁净系统
+      { goodsId: 'copper', amount: 200 },       // 电气系统
+      { goodsId: 'sensors', amount: 80 },       // 校准设备
+    ],
     productionSlots: [
       {
         type: 'process',
@@ -1814,6 +2211,14 @@ export const BUILDING_DEFINITIONS: Record<string, BuildingDef> = {
     maintenanceCost: 500000,
     maxWorkers: 400,
     templateId: 'MANUFACTURING',
+    constructionMaterials: [
+      { goodsId: 'cement', amount: 2500 },      // 厂房基础
+      { goodsId: 'steel', amount: 1800 },       // 结构框架
+      { goodsId: 'glass', amount: 300 },        // 洁净区域
+      { goodsId: 'aluminum', amount: 250 },     // 轻量化结构
+      { goodsId: 'copper', amount: 200 },       // 电气系统
+      { goodsId: 'mechanical-parts', amount: 200 }, // 组装线
+    ],
     productionSlots: [
       {
         type: 'process',
@@ -1875,6 +2280,15 @@ export const BUILDING_DEFINITIONS: Record<string, BuildingDef> = {
     maintenanceCost: 2500000,
     maxWorkers: 1800,
     templateId: 'MANUFACTURING',
+    constructionMaterials: [
+      { goodsId: 'cement', amount: 10000 },     // 巨型厂房基础
+      { goodsId: 'steel', amount: 7000 },       // 结构框架
+      { goodsId: 'aluminum', amount: 800 },     // 轻量化结构
+      { goodsId: 'copper', amount: 500 },       // 电气系统
+      { goodsId: 'mechanical-parts', amount: 700 }, // 生产线设备
+      { goodsId: 'electric-motor', amount: 50 }, // 机器人
+      { goodsId: 'sensors', amount: 200 },      // 自动化监控
+    ],
     productionSlots: [
       {
         type: 'process',
@@ -1941,6 +2355,13 @@ export const BUILDING_DEFINITIONS: Record<string, BuildingDef> = {
     maintenanceCost: 400000,
     maxWorkers: 450,
     templateId: 'MANUFACTURING',
+    constructionMaterials: [
+      { goodsId: 'cement', amount: 2500 },      // 厂房基础
+      { goodsId: 'steel', amount: 2000 },       // 结构框架
+      { goodsId: 'copper', amount: 250 },       // 电气系统
+      { goodsId: 'mechanical-parts', amount: 250 }, // 组装线
+      { goodsId: 'electric-motor', amount: 20 }, // 生产设备
+    ],
     productionSlots: [
       {
         type: 'process',
@@ -2021,6 +2442,12 @@ export const BUILDING_DEFINITIONS: Record<string, BuildingDef> = {
     maintenanceCost: 120000,
     maxWorkers: 250,
     templateId: 'MANUFACTURING',
+    constructionMaterials: [
+      { goodsId: 'cement', amount: 1000 },      // 厂房基础
+      { goodsId: 'steel', amount: 800 },        // 结构框架
+      { goodsId: 'plastic', amount: 200 },      // 模具材料
+      { goodsId: 'mechanical-parts', amount: 150 }, // 生产线
+    ],
     productionSlots: [
       {
         type: 'process',
@@ -2360,6 +2787,23 @@ export const BUILDING_DEFINITIONS: Record<string, BuildingDef> = {
             powerRequired: 100,
             efficiency: 1.0,
           },
+          {
+            id: 'dairy-products',
+            nameZh: '乳制品加工',
+            name: 'Dairy Processing',
+            description: '生产奶制品和乳饮料',
+            recipe: {
+              inputs: [
+                { goodsId: 'dairy', amount: 40 },
+                { goodsId: 'plastic', amount: 8 },
+              ],
+              outputs: [{ goodsId: 'packaged-food', amount: 45 }],
+              ticksRequired: 2,
+            },
+            laborRequired: 90,
+            powerRequired: 90,
+            efficiency: 1.1,
+          },
         ],
       },
     ],
@@ -2523,6 +2967,44 @@ export const BUILDING_DEFINITIONS: Record<string, BuildingDef> = {
             powerRequired: 200,
             efficiency: 1.0,
           },
+          {
+            id: 'full-electronics-retail',
+            nameZh: '全品类电子零售',
+            name: 'Full Electronics Retail',
+            description: '销售全线电子产品',
+            recipe: {
+              inputs: [
+                { goodsId: 'smartphone', amount: 3 },
+                { goodsId: 'premium-smartphone', amount: 2 },
+                { goodsId: 'smart-tv', amount: 3 },
+                { goodsId: 'gaming-console', amount: 2 },
+                { goodsId: 'personal-computer', amount: 2 },
+              ],
+              outputs: [{ goodsId: 'retail-revenue', amount: 400 }],
+              ticksRequired: 1,
+            },
+            laborRequired: 200,
+            powerRequired: 280,
+            efficiency: 1.2,
+          },
+          {
+            id: 'premium-electronics-retail',
+            nameZh: '高端电子产品零售',
+            name: 'Premium Electronics Retail',
+            description: '销售高端电子设备',
+            recipe: {
+              inputs: [
+                { goodsId: 'premium-smartphone', amount: 3 },
+                { goodsId: 'vr-headset', amount: 2 },
+                { goodsId: 'smart-tv', amount: 2 },
+              ],
+              outputs: [{ goodsId: 'retail-revenue', amount: 350 }],
+              ticksRequired: 1,
+            },
+            laborRequired: 180,
+            powerRequired: 250,
+            efficiency: 1.3,
+          },
         ],
       },
     ],
@@ -2559,6 +3041,51 @@ export const BUILDING_DEFINITIONS: Record<string, BuildingDef> = {
             laborRequired: 50,
             powerRequired: 100,
             efficiency: 1.0,
+          },
+          {
+            id: 'gasoline-car-sales',
+            nameZh: '燃油车销售',
+            name: 'Gasoline Car Sales',
+            description: '销售燃油汽车',
+            recipe: {
+              inputs: [{ goodsId: 'gasoline-car', amount: 1 }],
+              outputs: [{ goodsId: 'retail-revenue', amount: 400 }],
+              ticksRequired: 2,
+            },
+            laborRequired: 50,
+            powerRequired: 80,
+            efficiency: 1.0,
+          },
+          {
+            id: 'full-car-sales',
+            nameZh: '综合汽车销售',
+            name: 'Full Car Sales',
+            description: '销售多种类型汽车',
+            recipe: {
+              inputs: [
+                { goodsId: 'electric-vehicle', amount: 1 },
+                { goodsId: 'gasoline-car', amount: 1 },
+              ],
+              outputs: [{ goodsId: 'retail-revenue', amount: 950 }],
+              ticksRequired: 2,
+            },
+            laborRequired: 80,
+            powerRequired: 150,
+            efficiency: 1.1,
+          },
+          {
+            id: 'luxury-car-sales',
+            nameZh: '豪华车销售',
+            name: 'Luxury Car Sales',
+            description: '销售高端豪华汽车',
+            recipe: {
+              inputs: [{ goodsId: 'premium-ev', amount: 1 }],
+              outputs: [{ goodsId: 'retail-revenue', amount: 1200 }],
+              ticksRequired: 3,
+            },
+            laborRequired: 60,
+            powerRequired: 120,
+            efficiency: 1.2,
           },
         ],
       },
@@ -2598,6 +3125,206 @@ export const BUILDING_DEFINITIONS: Record<string, BuildingDef> = {
             },
             laborRequired: 40,
             powerRequired: 50,
+            efficiency: 1.0,
+          },
+          {
+            id: 'dairy-cafe',
+            nameZh: '奶茶咖啡厅',
+            name: 'Dairy Cafe',
+            description: '奶茶、咖啡等饮品',
+            recipe: {
+              inputs: [
+                { goodsId: 'dairy', amount: 10 },
+                { goodsId: 'beverages', amount: 5 },
+              ],
+              outputs: [{ goodsId: 'retail-revenue', amount: 40 }],
+              ticksRequired: 1,
+            },
+            laborRequired: 30,
+            powerRequired: 40,
+            efficiency: 1.1,
+          },
+        ],
+      },
+    ],
+  },
+
+  // ============ 新增建筑 ============
+
+  'gas-station': {
+    nameZh: '加油站',
+    name: 'Gas Station',
+    category: 'retail',
+    subcategory: '能源零售',
+    description: '销售燃油和汽车服务',
+    icon: '⛽',
+    size: 'medium',
+    baseCost: 50000000,
+    maintenanceCost: 80000,
+    maxWorkers: 30,
+    templateId: 'RETAIL',
+    productionSlots: [
+      {
+        type: 'process',
+        name: '经营模式',
+        defaultMethodId: 'fuel-retail',
+        methods: [
+          {
+            id: 'fuel-retail',
+            nameZh: '燃油零售',
+            name: 'Fuel Retail',
+            description: '销售汽油柴油',
+            recipe: {
+              inputs: [{ goodsId: 'refined-fuel', amount: 100 }],
+              outputs: [{ goodsId: 'retail-revenue', amount: 150 }],
+              ticksRequired: 1,
+            },
+            laborRequired: 20,
+            powerRequired: 30,
+            efficiency: 1.0,
+          },
+          {
+            id: 'full-service-station',
+            nameZh: '综合服务站',
+            name: 'Full Service Station',
+            description: '燃油+便利店',
+            recipe: {
+              inputs: [
+                { goodsId: 'refined-fuel', amount: 80 },
+                { goodsId: 'beverages', amount: 10 },
+                { goodsId: 'packaged-food', amount: 5 },
+              ],
+              outputs: [{ goodsId: 'retail-revenue', amount: 180 }],
+              ticksRequired: 1,
+            },
+            laborRequired: 30,
+            powerRequired: 50,
+            efficiency: 1.2,
+          },
+        ],
+      },
+    ],
+  },
+
+  'appliance-mall': {
+    nameZh: '家电卖场',
+    name: 'Appliance Mall',
+    category: 'retail',
+    subcategory: '家电零售',
+    description: '销售家用电器和生活用品',
+    icon: '🏠',
+    size: 'large',
+    baseCost: 150000000,
+    maintenanceCost: 300000,
+    maxWorkers: 250,
+    templateId: 'RETAIL',
+    constructionMaterials: [
+      { goodsId: 'cement', amount: 2000 },      // 商场基础
+      { goodsId: 'steel', amount: 1200 },       // 结构框架
+      { goodsId: 'glass', amount: 600 },        // 展示窗
+      { goodsId: 'aluminum', amount: 350 },     // 展柜
+    ],
+    productionSlots: [
+      {
+        type: 'process',
+        name: '经营模式',
+        defaultMethodId: 'appliance-retail',
+        methods: [
+          {
+            id: 'appliance-retail',
+            nameZh: '家电零售',
+            name: 'Appliance Retail',
+            description: '销售冰箱洗衣机等',
+            recipe: {
+              inputs: [
+                { goodsId: 'home-appliance', amount: 10 },
+                { goodsId: 'household-goods', amount: 30 },
+              ],
+              outputs: [{ goodsId: 'retail-revenue', amount: 180 }],
+              ticksRequired: 1,
+            },
+            laborRequired: 120,
+            powerRequired: 150,
+            efficiency: 1.0,
+          },
+          {
+            id: 'premium-appliance-retail',
+            nameZh: '高端家电零售',
+            name: 'Premium Appliance Retail',
+            description: '销售智能家电',
+            recipe: {
+              inputs: [
+                { goodsId: 'home-appliance', amount: 15 },
+                { goodsId: 'smart-tv', amount: 3 },
+              ],
+              outputs: [{ goodsId: 'retail-revenue', amount: 280 }],
+              ticksRequired: 1,
+            },
+            laborRequired: 150,
+            powerRequired: 200,
+            efficiency: 1.2,
+          },
+        ],
+      },
+    ],
+  },
+
+  'construction-supplier': {
+    nameZh: '建材供应商',
+    name: 'Construction Supplier',
+    category: 'retail',
+    subcategory: '建材零售',
+    description: '销售建筑材料',
+    icon: '🧱',
+    size: 'large',
+    baseCost: 80000000,
+    maintenanceCost: 150000,
+    maxWorkers: 100,
+    templateId: 'RETAIL',
+    constructionMaterials: [
+      { goodsId: 'cement', amount: 1500 },      // 仓库基础
+      { goodsId: 'steel', amount: 1000 },       // 仓库结构
+      { goodsId: 'aluminum', amount: 200 },     // 货架
+    ],
+    productionSlots: [
+      {
+        type: 'process',
+        name: '经营模式',
+        defaultMethodId: 'construction-retail',
+        methods: [
+          {
+            id: 'construction-retail',
+            nameZh: '建材零售',
+            name: 'Construction Materials Retail',
+            description: '销售水泥钢材等建材',
+            recipe: {
+              inputs: [
+                { goodsId: 'cement', amount: 100 },
+                { goodsId: 'steel', amount: 30 },
+                { goodsId: 'glass', amount: 20 },
+              ],
+              outputs: [{ goodsId: 'retail-revenue', amount: 120 }],
+              ticksRequired: 1,
+            },
+            laborRequired: 60,
+            powerRequired: 80,
+            efficiency: 1.0,
+          },
+          {
+            id: 'aluminum-supplier',
+            nameZh: '铝材供应',
+            name: 'Aluminum Supply',
+            description: '供应铝材和轻量建材',
+            recipe: {
+              inputs: [
+                { goodsId: 'aluminum', amount: 50 },
+                { goodsId: 'glass', amount: 30 },
+              ],
+              outputs: [{ goodsId: 'retail-revenue', amount: 100 }],
+              ticksRequired: 1,
+            },
+            laborRequired: 50,
+            powerRequired: 60,
             efficiency: 1.0,
           },
         ],

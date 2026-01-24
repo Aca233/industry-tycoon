@@ -2,8 +2,9 @@
  * 图表绘图工具函数
  */
 
-import type { YAxisTick, XAxisTick, ChartDimensions } from './types';
-import { formatGameTime } from '../../utils/formatters';
+import type { YAxisTick, XAxisTick, ChartDimensions, CandleLayoutResult } from './types';
+
+// TICKS_PER_DAY 在新时间体系中不再需要（1 tick = 1 天）
 
 /**
  * 设置 Canvas 高 DPI 支持
@@ -140,7 +141,102 @@ export function calculateYTicks(
 }
 
 /**
+ * 计算蜡烛最佳布局
+ * 根据图表宽度和数据量自动计算蜡烛宽度和间距
+ */
+export function calculateCandleLayout(
+  chartWidth: number,
+  dataCount: number,
+  options: {
+    minGap?: number;      // 最小间距
+    minWidth?: number;    // 最小蜡烛宽度
+    maxWidth?: number;    // 最大蜡烛宽度
+    widthRatio?: number;  // 蜡烛占比 (0-1)
+  } = {}
+): CandleLayoutResult {
+  const {
+    minGap = 1,
+    minWidth = 3,
+    maxWidth = 14,
+    widthRatio = 0.65
+  } = options;
+
+  if (dataCount <= 0) {
+    return { candleWidth: minWidth, gap: minGap, offset: 0, totalWidth: 0 };
+  }
+
+  // 每个数据点的槽宽度
+  const slotWidth = chartWidth / dataCount;
+  
+  // 计算理想的蜡烛宽度
+  let candleWidth = slotWidth * widthRatio;
+  
+  // 应用宽度限制
+  candleWidth = Math.max(minWidth, Math.min(maxWidth, candleWidth));
+  
+  // 计算间距
+  const gap = Math.max(minGap, slotWidth - candleWidth);
+  
+  // 计算总宽度和居中偏移
+  const totalWidth = candleWidth * dataCount + gap * (dataCount - 1);
+  const offset = Math.max(0, (chartWidth - totalWidth) / 2);
+
+  return { candleWidth, gap, offset, totalWidth };
+}
+
+/**
+ * 智能格式化图表时间轴标签
+ * 根据时间跨度和数据周期选择最佳格式
+ * 新时间体系：1 tick = 1 天
+ */
+export function formatChartAxisTime(
+  tick: number,
+  period: number,
+  timeSpan: number  // 总时间跨度 (ticks/天)
+): string {
+  const day = tick + 1; // tick 0 = 第1天
+  const week = Math.floor(tick / 7) + 1;
+  const month = Math.floor(tick / 30) + 1;
+  
+  // 短周期 (1-3天): 显示天数
+  if (period <= 3) {
+    if (timeSpan <= 7) {
+      // 1周内: 显示所有天
+      return `D${day}`;
+    } else if (timeSpan <= 30) {
+      // 1月内: 每周显示周标记，其他显示天
+      if (tick % 7 === 0) return `W${week}`;
+      return `D${day}`;
+    } else {
+      // 1月以上: 只在每周开始显示
+      if (tick % 7 === 0) return `W${week}`;
+      return '';
+    }
+  }
+  
+  // 中周期 (7天/周): 显示周
+  if (period <= 7) {
+    if (timeSpan <= 90) {
+      return `W${week}`;
+    }
+    // 3月以上: 每月显示月标记
+    if (tick % 30 === 0) return `M${month}`;
+    return `W${week}`;
+  }
+  
+  // 长周期 (30天/月): 显示月
+  if (period <= 30) {
+    return `M${month}`;
+  }
+  
+  // 超长周期 (>30天): 显示年
+  const year = Math.floor(tick / 365) + 1;
+  return `Y${year}`;
+}
+
+/**
  * 计算X轴刻度
+ * 使用固定的时间间隔来计算刻度位置，避免数据量变化时刻度位置跳动
  */
 export function calculateXTicks(
   data: { tick: number }[],
@@ -148,33 +244,93 @@ export function calculateXTicks(
   endIndex: number,
   chartWidth: number,
   marginLeft: number,
-  tickCount: number = 6
+  tickCount: number = 6,
+  period: number = 1  // 数据周期
 ): XAxisTick[] {
   const visibleData = data.slice(startIndex, endIndex);
   if (visibleData.length === 0) return [];
 
-  const step = Math.ceil(visibleData.length / tickCount);
-  const ticks: XAxisTick[] = [];
-
-  for (let i = 0; i < visibleData.length; i += step) {
-    const item = visibleData[i];
-    const x = marginLeft + (i / (visibleData.length - 1)) * chartWidth;
-    ticks.push({
-      tick: item.tick,
-      x,
-      label: formatGameTime(item.tick, 'chart', visibleData.length),
-    });
+  const firstTick = visibleData[0].tick;
+  const lastTick = visibleData[visibleData.length - 1].tick;
+  const tickRange = lastTick - firstTick;
+  
+  // 如果范围太小，直接返回首尾刻度
+  if (tickRange <= 0) {
+    return [{
+      tick: firstTick,
+      x: marginLeft,
+      label: formatChartAxisTime(firstTick, period, tickRange),
+    }];
   }
 
-  // 确保最后一个点
-  if (visibleData.length > 1) {
-    const lastItem = visibleData[visibleData.length - 1];
-    const lastX = marginLeft + chartWidth;
-    if (!ticks.some(t => t.tick === lastItem.tick)) {
+  // 根据周期选择合适的刻度间隔
+  // 目标：产生 4-8 个刻度
+  // 新时间体系: 1 tick = 1 天
+  const possibleIntervals = [
+    1,                       // 1天
+    3,                       // 3天
+    7,                       // 1周
+    14,                      // 2周
+    30,                      // 1月
+    90,                      // 1季度
+    365                      // 1年
+  ];
+  
+  let interval = 7; // 默认1周间隔
+  
+  // 选择能产生合适数量刻度的间隔
+  for (const pi of possibleIntervals) {
+    const count = tickRange / pi;
+    if (count >= 3 && count <= tickCount + 2) {
+      interval = pi;
+      break;
+    }
+  }
+  
+  // 如果数据范围太大，使用更大的间隔
+  if (tickRange / interval > tickCount + 2) {
+    for (const pi of possibleIntervals) {
+      if (tickRange / pi <= tickCount + 2) {
+        interval = pi;
+        break;
+      }
+    }
+  }
+  
+  // 如果数据范围太小，使用更小的间隔
+  if (tickRange / interval < 2) {
+    interval = Math.max(1, Math.floor(tickRange / 4));
+  }
+
+  const ticks: XAxisTick[] = [];
+  
+  // 找到第一个对齐到间隔的刻度
+  const firstAlignedTick = Math.ceil(firstTick / interval) * interval;
+  
+  // 生成对齐的刻度
+  for (let t = firstAlignedTick; t <= lastTick; t += interval) {
+    // 计算此 tick 在 x 轴上的位置
+    const ratio = (t - firstTick) / tickRange;
+    const x = marginLeft + ratio * chartWidth;
+    
+    const label = formatChartAxisTime(t, period, tickRange);
+    if (label) {  // 只添加有标签的刻度
+      ticks.push({ tick: t, x, label });
+    }
+  }
+
+  // 如果没有生成任何刻度，至少显示首尾
+  if (ticks.length === 0) {
+    ticks.push({
+      tick: firstTick,
+      x: marginLeft,
+      label: formatChartAxisTime(firstTick, period, tickRange),
+    });
+    if (tickRange > 0) {
       ticks.push({
-        tick: lastItem.tick,
-        x: lastX,
-        label: formatGameTime(lastItem.tick, 'chart', visibleData.length),
+        tick: lastTick,
+        x: marginLeft + chartWidth,
+        label: formatChartAxisTime(lastTick, period, tickRange),
       });
     }
   }
@@ -266,36 +422,117 @@ export function drawGradientArea(
 }
 
 /**
- * 绘制蜡烛图
+ * 绘制专业K线蜡烛图
+ * 支持圆角、影线细节、可选空心阳线
  */
 export function drawCandle(
   ctx: CanvasRenderingContext2D,
-  x: number,
+  x: number,           // 蜡烛左边缘X坐标
   width: number,
-  open: number,
-  high: number,
-  low: number,
-  close: number,
+  open: number,        // Y坐标
+  high: number,        // Y坐标
+  low: number,         // Y坐标
+  close: number,       // Y坐标
   upColor: string,
-  downColor: string
+  downColor: string,
+  options: {
+    wickColor?: string;      // 影线颜色（可选）
+    hollowUp?: boolean;      // 阳线是否空心
+    borderRadius?: number;   // 圆角半径
+  } = {}
 ): void {
-  const isUp = close >= open;
+  const {
+    wickColor,
+    hollowUp = false,
+    borderRadius = 1
+  } = options;
+
+  const isUp = close <= open;  // Y轴向下，close < open 表示涨
   const color = isUp ? upColor : downColor;
   const bodyTop = Math.min(open, close);
   const bodyBottom = Math.max(open, close);
   const bodyHeight = Math.max(1, bodyBottom - bodyTop);
+  const centerX = x + width / 2;
 
-  // 绘制影线
-  ctx.strokeStyle = color;
-  ctx.lineWidth = 1;
+  // 1. 绘制影线 (wick/shadow)
+  const wickLineWidth = Math.max(1, Math.min(2, width * 0.15));
+  ctx.strokeStyle = wickColor || color;
+  ctx.lineWidth = wickLineWidth;
+  ctx.lineCap = 'round';
+  
   ctx.beginPath();
-  ctx.moveTo(x + width / 2, high);
-  ctx.lineTo(x + width / 2, low);
+  // 上影线
+  if (high < bodyTop - 1) {
+    ctx.moveTo(centerX, high);
+    ctx.lineTo(centerX, bodyTop);
+  }
+  // 下影线
+  if (low > bodyBottom + 1) {
+    ctx.moveTo(centerX, bodyBottom);
+    ctx.lineTo(centerX, low);
+  }
   ctx.stroke();
 
-  // 绘制实体
-  ctx.fillStyle = color;
-  ctx.fillRect(x, bodyTop, width, bodyHeight);
+  // 2. 绘制实体
+  const radius = Math.min(borderRadius, width / 4, bodyHeight / 4);
+  
+  if (hollowUp && isUp && width > 5) {
+    // 空心阳线
+    ctx.strokeStyle = color;
+    ctx.lineWidth = Math.max(1, width * 0.15);
+    ctx.beginPath();
+    if (radius > 0 && bodyHeight > 2) {
+      ctx.roundRect(x, bodyTop, width, bodyHeight, radius);
+    } else {
+      ctx.rect(x, bodyTop, width, bodyHeight);
+    }
+    ctx.stroke();
+  } else {
+    // 实心蜡烛
+    ctx.fillStyle = color;
+    ctx.beginPath();
+    if (radius > 0 && bodyHeight > 2) {
+      ctx.roundRect(x, bodyTop, width, bodyHeight, radius);
+    } else {
+      ctx.rect(x, bodyTop, width, bodyHeight);
+    }
+    ctx.fill();
+  }
+}
+
+/**
+ * 绘制当前价格水平线
+ */
+export function drawCurrentPriceLine(
+  ctx: CanvasRenderingContext2D,
+  y: number,
+  startX: number,
+  _endX: number,  // 保留参数以备将来使用
+  labelX: number,
+  price: number,
+  isUp: boolean,
+  upColor: string,
+  downColor: string,
+  formatPrice: (v: number) => string
+): void {
+  const color = isUp ? upColor : downColor;
+  
+  // 绘制虚线
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 1;
+  ctx.setLineDash([4, 3]);
+  ctx.globalAlpha = 0.6;
+  
+  ctx.beginPath();
+  ctx.moveTo(startX, y);
+  ctx.lineTo(labelX - 5, y);
+  ctx.stroke();
+  
+  ctx.setLineDash([]);
+  ctx.globalAlpha = 1;
+  
+  // 绘制价格标签
+  drawPriceLabel(ctx, price, y, labelX, isUp, upColor, downColor, formatPrice);
 }
 
 /**
@@ -408,31 +645,94 @@ export function downsampleData<T extends { tick: number }>(
 }
 
 /**
- * 计算价格范围（含边距）
+ * 计算价格范围（含智能边距和最小范围限制）
  */
 export function calculatePriceRange(
-  data: { high?: number; low?: number; value?: number }[],
-  paddingPercent: number = 0.05
-): { min: number; max: number } {
-  let min = Infinity;
-  let max = -Infinity;
+  data: { high?: number; low?: number; value?: number; open?: number; close?: number }[],
+  options: {
+    paddingPercent?: number;   // 边距百分比
+    minRangePercent?: number;  // 最小范围百分比（相对于中心价格）
+    roundToNice?: boolean;     // 是否圆整到"好看"的数字
+  } = {}
+): { min: number; max: number; step?: number } {
+  const {
+    paddingPercent = 0.08,
+    minRangePercent = 0.05,  // 至少 5% 的价格范围
+    roundToNice = true
+  } = options;
+
+  let dataMin = Infinity;
+  let dataMax = -Infinity;
 
   data.forEach(d => {
-    if (d.high !== undefined) max = Math.max(max, d.high);
-    if (d.low !== undefined) min = Math.min(min, d.low);
+    if (d.high !== undefined) dataMax = Math.max(dataMax, d.high);
+    if (d.low !== undefined) dataMin = Math.min(dataMin, d.low);
     if (d.value !== undefined) {
-      max = Math.max(max, d.value);
-      min = Math.min(min, d.value);
+      dataMax = Math.max(dataMax, d.value);
+      dataMin = Math.min(dataMin, d.value);
+    }
+    if (d.open !== undefined) {
+      dataMax = Math.max(dataMax, d.open);
+      dataMin = Math.min(dataMin, d.open);
+    }
+    if (d.close !== undefined) {
+      dataMax = Math.max(dataMax, d.close);
+      dataMin = Math.min(dataMin, d.close);
     }
   });
 
-  const range = max - min;
-  const padding = range * paddingPercent;
+  // 处理空数据或无效数据
+  if (!isFinite(dataMin) || !isFinite(dataMax)) {
+    return { min: 0, max: 100, step: 20 };
+  }
 
-  return {
-    min: min - padding,
-    max: max + padding,
-  };
+  const dataRange = dataMax - dataMin;
+  const centerPrice = (dataMax + dataMin) / 2;
+  
+  // 确保最小范围（避免过于扁平的图表）
+  const minRange = centerPrice * minRangePercent;
+  const effectiveRange = Math.max(dataRange, minRange);
+  
+  // 添加边距
+  const padding = effectiveRange * paddingPercent;
+  
+  let min = centerPrice - effectiveRange / 2 - padding;
+  let max = centerPrice + effectiveRange / 2 + padding;
+  
+  // 确保 min 不为负（价格不能为负）
+  if (min < 0 && dataMin >= 0) {
+    min = 0;
+    max = effectiveRange * (1 + paddingPercent * 2);
+  }
+  
+  // 圆整到"好看"的数字
+  if (roundToNice) {
+    const step = calculateNiceStep(max - min, 5);
+    min = Math.floor(min / step) * step;
+    max = Math.ceil(max / step) * step;
+    return { min, max, step };
+  }
+
+  return { min, max };
+}
+
+/**
+ * 计算"好看"的刻度间隔
+ */
+export function calculateNiceStep(range: number, targetTicks: number): number {
+  if (range <= 0 || targetTicks <= 0) return 1;
+  
+  const roughStep = range / targetTicks;
+  const magnitude = Math.pow(10, Math.floor(Math.log10(roughStep)));
+  const normalized = roughStep / magnitude;
+  
+  let niceStep: number;
+  if (normalized <= 1) niceStep = 1;
+  else if (normalized <= 2) niceStep = 2;
+  else if (normalized <= 5) niceStep = 5;
+  else niceStep = 10;
+  
+  return niceStep * magnitude;
 }
 
 /**

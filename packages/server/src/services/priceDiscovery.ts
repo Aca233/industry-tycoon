@@ -76,6 +76,9 @@ export class PriceDiscoveryService extends EventEmitter {
   
   /**
    * 更新单个商品的价格
+   *
+   * 简化版本：价格直接使用最后成交价，只有发生交易时价格才会变动
+   * 这更符合真实市场经济的价格发现机制
    */
   updatePrice(goodsId: string, currentTick: number): void {
     const state = this.priceStates.get(goodsId);
@@ -83,6 +86,7 @@ export class PriceDiscoveryService extends EventEmitter {
     
     // 获取最新成交价
     const lastTradePrice = matchingEngine.getLastTradePrice(goodsId);
+    const lastTradeTick = matchingEngine.getLastTradeTick(goodsId);
     state.lastTradePrice = lastTradePrice;
     
     // 获取订单簿深度信息
@@ -90,32 +94,34 @@ export class PriceDiscoveryService extends EventEmitter {
     state.bestBid = depth.bestBid;
     state.bestAsk = depth.bestAsk;
     
-    // 计算新价格
-    const newPrice = this.calculatePrice(state, depth);
-    
-    // 应用价格变化限制
-    const maxChange = state.currentPrice * this.MAX_PRICE_CHANGE;
-    const priceDiff = newPrice - state.currentPrice;
-    const clampedDiff = Math.max(-maxChange, Math.min(maxChange, priceDiff));
-    
-    // 计算新价格，并应用基于 basePrice 的上下限
-    const minPrice = state.basePrice * this.MIN_PRICE_MULTIPLIER;
-    const maxPrice = state.basePrice * this.MAX_PRICE_MULTIPLIER;
-    const finalPrice = Math.max(minPrice, Math.min(maxPrice, state.currentPrice + clampedDiff));
-    
-    // 只有价格变化时才记录
-    if (Math.abs(finalPrice - state.currentPrice) > 0.001) {
-      state.currentPrice = finalPrice;
+    // 核心变化：价格直接使用最后成交价
+    // 只有在有成交记录，且成交发生在本tick时才更新价格
+    if (lastTradePrice !== null && lastTradeTick !== null && lastTradeTick === currentTick) {
+      // 应用基于 basePrice 的上下限
+      const minPrice = state.basePrice * this.MIN_PRICE_MULTIPLIER;
+      const maxPrice = state.basePrice * this.MAX_PRICE_MULTIPLIER;
+      const finalPrice = Math.max(minPrice, Math.min(maxPrice, lastTradePrice));
       
-      // 记录价格历史
-      this.recordPricePoint(state, currentTick, depth);
-      
-      this.emit('priceUpdated', {
-        goodsId,
-        price: finalPrice,
-        tick: currentTick,
-      });
+      // 只有价格变化时才记录
+      if (Math.abs(finalPrice - state.currentPrice) > 0.001) {
+        state.currentPrice = finalPrice;
+        
+        // 记录价格历史
+        this.recordPricePoint(state, currentTick, depth);
+        
+        this.emit('priceUpdated', {
+          goodsId,
+          price: finalPrice,
+          tick: currentTick,
+        });
+      }
+    } else if (lastTradePrice !== null && state.currentPrice === state.basePrice) {
+      // 如果还没更新过价格，但历史有成交，使用历史成交价初始化
+      const minPrice = state.basePrice * this.MIN_PRICE_MULTIPLIER;
+      const maxPrice = state.basePrice * this.MAX_PRICE_MULTIPLIER;
+      state.currentPrice = Math.max(minPrice, Math.min(maxPrice, lastTradePrice));
     }
+    // 如果没有成交，价格保持不变
     
     state.lastUpdateTick = currentTick;
   }

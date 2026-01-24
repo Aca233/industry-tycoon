@@ -1,16 +1,23 @@
 /**
- * Settings Modal - LLM API Configuration
- * 游戏内设置弹窗，用于配置LLM API
+ * Settings Modal - 游戏设置弹窗
+ * 包含 LLM API 配置和音效设置
  */
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { api } from '../../api/client.js';
+import { AudioSettingsPanel } from './AudioSettingsPanel';
+import { useUISound } from '../../audio';
+
+// 设置标签类型
+type SettingsTab = 'audio' | 'llm';
 
 interface SettingsModalProps {
   onClose: () => void;
+  defaultTab?: SettingsTab;
 }
 
-export function SettingsModal({ onClose }: SettingsModalProps) {
+export function SettingsModal({ onClose, defaultTab = 'audio' }: SettingsModalProps) {
+  const [activeTab, setActiveTab] = useState<SettingsTab>(defaultTab);
   const [apiKey, setApiKey] = useState('');
   const [baseUrl, setBaseUrl] = useState('');
   const [model, setModel] = useState('');
@@ -21,6 +28,8 @@ export function SettingsModal({ onClose }: SettingsModalProps) {
   const [availableModels, setAvailableModels] = useState<string[]>([]);
   const [testResult, setTestResult] = useState<{ success: boolean; message: string } | null>(null);
   const [error, setError] = useState<string | null>(null);
+  
+  const { playPanelClose, playTabSwitch } = useUISound();
 
   // Load current config on mount
   useEffect(() => {
@@ -159,35 +168,80 @@ export function SettingsModal({ onClose }: SettingsModalProps) {
     }
   };
 
-  const handleBackdropClick = (e: React.MouseEvent) => {
+  const handleBackdropClick = useCallback((e: React.MouseEvent) => {
     if (e.target === e.currentTarget) {
+      playPanelClose();
       onClose();
     }
-  };
+  }, [onClose, playPanelClose]);
+
+  const handleClose = useCallback(() => {
+    playPanelClose();
+    onClose();
+  }, [onClose, playPanelClose]);
+
+  const handleTabChange = useCallback((tab: SettingsTab) => {
+    if (tab !== activeTab) {
+      playTabSwitch();
+      setActiveTab(tab);
+    }
+  }, [activeTab, playTabSwitch]);
+
+  // 标签配置
+  const tabs: { id: SettingsTab; label: string; icon: string }[] = [
+    { id: 'audio', label: '音效设置', icon: '🔊' },
+    { id: 'llm', label: 'AI 设置', icon: '🤖' },
+  ];
 
   return (
-    <div 
-      className="fixed inset-0 bg-black/70 z-50 flex items-center justify-center p-4"
+    <div
+      className="fixed inset-0 bg-black/70 z-50 flex items-center justify-center p-4 backdrop-blur-sm"
       onClick={handleBackdropClick}
     >
-      <div className="bg-slate-800 rounded-xl max-w-lg w-full shadow-2xl border border-slate-700">
+      <div className="bg-slate-800 rounded-xl max-w-lg w-full shadow-2xl border border-slate-700 overflow-hidden">
         {/* Header */}
-        <div className="flex items-center justify-between p-4 border-b border-slate-700">
+        <div className="flex items-center justify-between p-4 border-b border-slate-700 bg-slate-800/80">
           <h2 className="text-xl font-bold text-white flex items-center gap-2">
             <span>⚙️</span>
-            <span>LLM API 设置</span>
+            <span>游戏设置</span>
           </h2>
           <button
-            onClick={onClose}
-            className="text-gray-400 hover:text-white transition-colors"
+            onClick={handleClose}
+            className="text-gray-400 hover:text-white transition-colors p-1 hover:bg-slate-700 rounded"
           >
             ✕
           </button>
         </div>
 
+        {/* Tabs */}
+        <div className="flex border-b border-slate-700 bg-slate-800/50">
+          {tabs.map((tab) => (
+            <button
+              key={tab.id}
+              onClick={() => handleTabChange(tab.id)}
+              className={`flex-1 px-4 py-3 text-sm font-medium transition-all duration-200 flex items-center justify-center gap-2
+                ${activeTab === tab.id
+                  ? 'text-cyan-400 border-b-2 border-cyan-400 bg-slate-700/30'
+                  : 'text-gray-400 hover:text-gray-200 hover:bg-slate-700/20'
+                }`}
+            >
+              <span>{tab.icon}</span>
+              <span>{tab.label}</span>
+            </button>
+          ))}
+        </div>
+
         {/* Content */}
-        <div className="p-4 space-y-4">
-          {loading ? (
+        <div className="p-4 max-h-[60vh] overflow-y-auto">
+          {/* Audio Settings Tab */}
+          {activeTab === 'audio' && (
+            <AudioSettingsPanel />
+          )}
+
+          {/* LLM Settings Tab */}
+          {activeTab === 'llm' && (
+            <div className="space-y-4">
+              {loading ? (
             <div className="text-center py-8">
               <div className="animate-spin w-8 h-8 border-2 border-cyan-500 border-t-transparent rounded-full mx-auto mb-2"></div>
               <p className="text-gray-400">加载配置中...</p>
@@ -292,55 +346,72 @@ export function SettingsModal({ onClose }: SettingsModalProps) {
                 </div>
               )}
             </>
+              )}
+            </div>
           )}
         </div>
 
-        {/* Footer */}
-        <div className="flex items-center justify-between p-4 border-t border-slate-700">
-          <button
-            onClick={handleTest}
-            disabled={loading || testing}
-            className="px-4 py-2 bg-slate-700 text-white rounded-lg hover:bg-slate-600 transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2"
-          >
-            {testing ? (
-              <>
-                <span className="animate-spin w-4 h-4 border-2 border-white border-t-transparent rounded-full"></span>
-                <span>测试中...</span>
-              </>
-            ) : (
-              <>
-                <span>🔌</span>
-                <span>测试连接</span>
-              </>
-            )}
-          </button>
-          
-          <div className="flex gap-2">
+        {/* Footer - Only show for LLM tab */}
+        {activeTab === 'llm' && (
+          <div className="flex items-center justify-between p-4 border-t border-slate-700 bg-slate-800/50">
             <button
-              onClick={onClose}
-              className="px-4 py-2 bg-slate-700 text-white rounded-lg hover:bg-slate-600 transition-colors"
+              onClick={handleTest}
+              disabled={loading || testing}
+              className="px-4 py-2 bg-slate-700 text-white rounded-lg hover:bg-slate-600 transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2"
             >
-              取消
+              {testing ? (
+                <>
+                  <span className="animate-spin w-4 h-4 border-2 border-white border-t-transparent rounded-full"></span>
+                  <span>测试中...</span>
+                </>
+              ) : (
+                <>
+                  <span>🔌</span>
+                  <span>测试连接</span>
+                </>
+              )}
             </button>
-            <button
-              onClick={handleSave}
-              disabled={loading || saving}
-              className="px-4 py-2 bg-cyan-600 text-white rounded-lg hover:bg-cyan-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2"
-            >
-              {saving ? (
+            
+            <div className="flex gap-2">
+              <button
+                onClick={handleClose}
+                className="px-4 py-2 bg-slate-700 text-white rounded-lg hover:bg-slate-600 transition-colors"
+              >
+                取消
+              </button>
+              <button
+                onClick={handleSave}
+                disabled={loading || saving}
+                className="px-4 py-2 bg-cyan-600 text-white rounded-lg hover:bg-cyan-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2"
+              >
+                {saving ? (
                 <>
                   <span className="animate-spin w-4 h-4 border-2 border-white border-t-transparent rounded-full"></span>
                   <span>保存中...</span>
                 </>
               ) : (
-                <>
-                  <span>💾</span>
-                  <span>保存配置</span>
-                </>
-              )}
+                  <>
+                    <span>💾</span>
+                    <span>保存配置</span>
+                  </>
+                )}
+                </button>
+              </div>
+          </div>
+        )}
+
+        {/* Footer for Audio tab */}
+        {activeTab === 'audio' && (
+          <div className="flex items-center justify-end p-4 border-t border-slate-700 bg-slate-800/50">
+            <button
+              onClick={handleClose}
+              className="px-4 py-2 bg-cyan-600 text-white rounded-lg hover:bg-cyan-700 transition-colors flex items-center gap-2"
+            >
+              <span>✓</span>
+              <span>完成</span>
             </button>
           </div>
-        </div>
+        )}
       </div>
     </div>
   );

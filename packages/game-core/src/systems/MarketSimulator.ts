@@ -225,8 +225,8 @@ export class MarketSimulator implements GameSubsystem {
       
       history.push(record);
       
-      // Trim old history
-      const maxHistory = MARKET_CONSTANTS.PRICE_HISTORY_RETENTION / 24;
+      // Trim old history (1 tick = 1 day, so maxHistory equals retention in days)
+      const maxHistory = MARKET_CONSTANTS.PRICE_HISTORY_RETENTION;
       if (history.length > maxHistory) {
         history.splice(0, history.length - maxHistory);
       }

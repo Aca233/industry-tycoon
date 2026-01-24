@@ -85,13 +85,33 @@ export async function gameRoutes(app: FastifyInstance) {
     const { gameId } = request.params as { gameId: string };
     const body = setGameSpeedSchema.parse(request.body);
     
-    // TODO: Update game state
+    // 确保游戏存在
+    const gameState = gameLoop.getOrCreateGame(gameId, 'player-company-1');
+    if (!gameState) {
+      return reply.code(404).send({ error: '游戏不存在' });
+    }
+    
+    // 根据 isPaused 参数决定操作
+    if (body.isPaused === false) {
+      // 取消暂停，开始游戏
+      gameLoop.setSpeed(gameId, body.speed as import('@scc/shared').GameSpeed);
+    } else if (body.isPaused === true || body.speed === 0) {
+      // 暂停游戏
+      gameLoop.setSpeed(gameId, 0 as import('@scc/shared').GameSpeed);
+    } else {
+      // 仅改变速度
+      gameLoop.setSpeed(gameId, body.speed as import('@scc/shared').GameSpeed);
+    }
+    
+    // 获取更新后的状态
+    const updatedState = gameLoop.getGame(gameId);
+    
     app.log.info({ gameId, ...body }, 'Game control updated');
     
-    return reply.send({ 
-      gameId, 
-      speed: body.speed, 
-      isPaused: body.isPaused ?? (body.speed === 0) 
+    return reply.send({
+      gameId,
+      speed: updatedState?.speed ?? body.speed,
+      isPaused: updatedState?.isPaused ?? (body.speed === 0)
     });
   });
 
@@ -115,6 +135,10 @@ export async function gameRoutes(app: FastifyInstance) {
       currentMethodId: b.currentMethodId,
       efficiency: b.efficiency,
       utilization: b.utilization,
+      status: b.status, // 关键：包含建筑状态
+      productionProgress: b.productionProgress,
+      constructionProgress: b.constructionProgress,
+      constructionTimeRequired: b.constructionTimeRequired,
     }));
     
     return reply.send({ buildings });
@@ -467,7 +491,7 @@ export async function gameRoutes(app: FastifyInstance) {
       return reply.code(404).send({ error: '游戏不存在' });
     }
     
-    const tickCount = ticks ? parseInt(ticks) : 720; // 默认统计最近30天（720 tick）
+    const tickCount = ticks ? parseInt(ticks) : 30; // 默认统计最近30天（30 tick，1 tick = 1天）
     const marketShare = economyManager.getMarketShare(goodsId, tickCount);
     const playerShare = economyManager.getPlayerMarketShare(gameState.playerCompanyId, goodsId, tickCount);
     

@@ -155,3 +155,27 @@ export interface XAxisTick {
   x: number;
   label: string;
 }
+
+/** 蜡烛布局计算结果 */
+export interface CandleLayoutResult {
+  candleWidth: number;   // 蜡烛宽度
+  gap: number;           // 蜡烛间距
+  offset: number;        // 居中偏移
+  totalWidth: number;    // 总宽度
+}
+
+/** 周期配置 */
+export interface PeriodConfig {
+  period: number;        // 聚合周期 (ticks)
+  maxCandles: number;    // 最大显示蜡烛数
+  label: string;         // 显示标签
+}
+
+/** 预定义周期配置 */
+export const PERIOD_CONFIGS: PeriodConfig[] = [
+  { period: 1, maxCandles: 200, label: '1H' },
+  { period: 3, maxCandles: 150, label: '3H' },
+  { period: 6, maxCandles: 100, label: '6H' },
+  { period: 12, maxCandles: 80, label: '12H' },
+  { period: 24, maxCandles: 90, label: '1D' },
+];

@@ -251,8 +251,8 @@ export class ResearchService {
     patents: new Map(),
   };
 
-  // 专利有效期（tick数，假设1天=24tick，5年=43800tick）
-  private readonly PATENT_DURATION = 43800;
+  // 专利有效期（tick数，1天=1tick，5年=1825tick）
+  private readonly PATENT_DURATION = 1825;
   
   // 每tick的进度比例（基于投入资金）
   // 调整为更快的进度：资金充足时每tick增加0.5%，约200 tick (~3分钟)完成
@@ -362,7 +362,7 @@ export class ResearchService {
       const feasibility: FeasibilityEvaluation = {
         score: response.feasibilityScore,
         estimatedCost: response.estimatedCost,
-        estimatedTicks: response.estimatedMonths * 30 * 24, // 月转tick
+        estimatedTicks: response.estimatedMonths * 30, // 月转tick（1 tick = 1天）
         prerequisites: response.prerequisites,
         risks: response.risks,
         riskLevel: response.riskLevel,
@@ -544,7 +544,7 @@ export class ResearchService {
     return {
       feasibilityScore: Math.round(result.feasibility * 100),
       estimatedCost: result.estimatedCost,
-      estimatedMonths: Math.ceil(result.estimatedTicks / (30 * 24)),
+      estimatedMonths: Math.ceil(result.estimatedTicks / 30), // tick转月（1 tick = 1天）
       prerequisites: [],
       risks: result.risks,
       scientistComment: `可行性评估完成。${result.potentialEffects.join(' ')}`,
@@ -637,7 +637,7 @@ export class ResearchService {
       severity: se.severity as SideEffectSeverity,
       triggerCondition: se.triggerCondition,
       probability: se.probability,
-      delayTicks: se.delayMonths * 30 * 24,
+      delayTicks: se.delayMonths * 30, // 月转tick（1 tick = 1天）
       triggered: false,
       revealed: false,
       effect: {

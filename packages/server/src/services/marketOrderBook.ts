@@ -7,6 +7,7 @@
  * - 使用索引直接删除订单 O(1)
  * - 缓存活跃订单数量避免重复遍历
  * - 优化订单匹配算法
+ * - 增量式撮合：通知撮合引擎有新订单到达
  */
 
 import { EventEmitter } from 'events';
@@ -77,16 +78,27 @@ export class MarketOrderBook extends EventEmitter {
   private orders: Map<string, MarketOrder> = new Map();
   /** 订单ID计数器 */
   private orderIdCounter: number = 0;
-  /** 默认订单有效期（tick数）- 缩短到48 ticks（2天）减少订单累积 */
-  private readonly DEFAULT_VALIDITY_TICKS = 48; // 2天
+  /** 默认订单有效期（tick数）- 缩短到24 ticks（1天）减少订单累积 */
+  private readonly DEFAULT_VALIDITY_TICKS = 24; // 1天
   /** 每个商品最大订单数限制 */
-  private readonly MAX_ORDERS_PER_GOODS = 300;
+  private readonly MAX_ORDERS_PER_GOODS = 100; // 降低限制
   /** 每家公司每种商品最大活跃订单数 */
-  private readonly MAX_ORDERS_PER_COMPANY_GOODS = 5;
+  private readonly MAX_ORDERS_PER_COMPANY_GOODS = 3; // 降低限制
+  /** 有活跃订单的商品ID缓存 */
+  private activeGoodsSet: Set<string> = new Set();
+  /** 新订单回调（用于增量式撮合） */
+  private onNewOrderCallback: ((goodsId: string, orderId: string) => void) | null = null;
   
   constructor() {
     super();
     this.initializeOrderBooks();
+  }
+  
+  /**
+   * 设置新订单回调（供撮合引擎使用）
+   */
+  setNewOrderCallback(callback: (goodsId: string, orderId: string) => void): void {
+    this.onNewOrderCallback = callback;
   }
   
   /**
@@ -195,10 +207,107 @@ export class MarketOrderBook extends EventEmitter {
       this.updateBestPricesOptimized(orderBook);
     }
     
+    // 更新活跃商品缓存
+    this.activeGoodsSet.add(goodsId);
+    
+    // 通知撮合引擎有新订单（增量撮合优化）
+    if (this.onNewOrderCallback) {
+      this.onNewOrderCallback(goodsId, orderId);
+    }
+    
     this.emit('orderSubmitted', { order, type: 'buy' });
-    console.log(`[MarketOrderBook] Buy order submitted: ${quantity} ${goodsId} @ ${maxPrice}`);
+    // 降低日志频率，只记录大额订单
+    if (quantity > 100) {
+      console.log(`[MarketOrderBook] Buy order submitted: ${quantity} ${goodsId} @ ${maxPrice}`);
+    }
     
     return order;
+  }
+  
+  /**
+   * 批量提交买单（性能优化版）
+   * 减少索引重建次数，提高批量操作效率
+   */
+  submitBuyOrdersBatch(
+    orders: Array<{
+      companyId: string;
+      goodsId: string;
+      quantity: number;
+      price: number;
+    }>,
+    currentTick: number,
+    validityTicks: number = this.DEFAULT_VALIDITY_TICKS
+  ): MarketOrder[] {
+    const results: MarketOrder[] = [];
+    
+    // 按商品分组
+    const byGoods = new Map<string, Array<{
+      companyId: string;
+      quantity: number;
+      price: number;
+    }>>();
+    
+    for (const o of orders) {
+      const existing = byGoods.get(o.goodsId);
+      if (existing) {
+        existing.push({ companyId: o.companyId, quantity: o.quantity, price: o.price });
+      } else {
+        byGoods.set(o.goodsId, [{ companyId: o.companyId, quantity: o.quantity, price: o.price }]);
+      }
+    }
+    
+    // 批量处理每个商品的订单
+    for (const [goodsId, groupOrders] of byGoods) {
+      const orderBook = this.orderBooks.get(goodsId);
+      if (!orderBook) continue;
+      
+      const newOrders: MarketOrder[] = [];
+      
+      for (const o of groupOrders) {
+        // 检查订单限制
+        if (orderBook.activeBuyCount >= this.MAX_ORDERS_PER_GOODS) continue;
+        
+        const orderId = this.generateOrderId();
+        const order: MarketOrder = {
+          id: orderId,
+          companyId: o.companyId,
+          goodsId,
+          orderType: 'buy',
+          quantity: o.quantity,
+          remainingQuantity: o.quantity,
+          pricePerUnit: o.price,
+          status: 'open',
+          createdTick: currentTick,
+          expiryTick: currentTick + validityTicks,
+          lastUpdateTick: currentTick,
+        };
+        
+        this.orders.set(orderId, order);
+        newOrders.push(order);
+        results.push(order);
+      }
+      
+      if (newOrders.length > 0) {
+        // 批量添加订单
+        orderBook.buyOrders.push(...newOrders);
+        // 只排序一次
+        orderBook.buyOrders.sort((a, b) => b.pricePerUnit - a.pricePerUnit);
+        // 只重建一次索引
+        this.rebuildBuyOrderIndex(orderBook);
+        orderBook.activeBuyCount += newOrders.length;
+        this.updateBestPricesOptimized(orderBook);
+        this.activeGoodsSet.add(goodsId);
+        
+        // 通知撮合引擎有新订单（增量撮合优化）
+        if (this.onNewOrderCallback) {
+          for (const order of newOrders) {
+            this.onNewOrderCallback(goodsId, order.id);
+          }
+        }
+      }
+    }
+    
+    return results;
   }
   
   /**
@@ -277,8 +386,19 @@ export class MarketOrderBook extends EventEmitter {
       this.updateBestPricesOptimized(orderBook);
     }
     
+    // 更新活跃商品缓存
+    this.activeGoodsSet.add(goodsId);
+    
+    // 通知撮合引擎有新订单（增量撮合优化）
+    if (this.onNewOrderCallback) {
+      this.onNewOrderCallback(goodsId, orderId);
+    }
+    
     this.emit('orderSubmitted', { order, type: 'sell' });
-    console.log(`[MarketOrderBook] Sell order submitted: ${quantity} ${goodsId} @ ${minPrice}`);
+    // 降低日志频率
+    if (quantity > 100) {
+      console.log(`[MarketOrderBook] Sell order submitted: ${quantity} ${goodsId} @ ${minPrice}`);
+    }
     
     return order;
   }
@@ -638,10 +758,22 @@ export class MarketOrderBook extends EventEmitter {
     }
   }
   
+  /** 上次清理的tick */
+  private lastCleanupTick: number = 0;
+  /** 清理间隔（每10 tick清理一次，减少开销） */
+  private readonly CLEANUP_INTERVAL = 10;
+  
   /**
-   * 清理过期订单
+   * 清理过期订单（节流版）
+   * 每10 tick执行一次，降低清理开销
    */
   cleanupExpiredOrders(currentTick: number): number {
+    // 节流：每10 tick才清理一次
+    if (currentTick - this.lastCleanupTick < this.CLEANUP_INTERVAL) {
+      return 0;
+    }
+    this.lastCleanupTick = currentTick;
+    
     let cleanedCount = 0;
     
     for (const [orderId, order] of this.orders) {
@@ -685,6 +817,26 @@ export class MarketOrderBook extends EventEmitter {
     }
     
     return cleanedCount;
+  }
+  
+  /**
+   * 获取有活跃订单的商品列表（性能优化）
+   * 使用缓存避免每次遍历所有订单簿
+   */
+  getGoodsWithActiveOrders(): string[] {
+    return Array.from(this.activeGoodsSet);
+  }
+  
+  /**
+   * 刷新活跃商品缓存（在清理订单后调用）
+   */
+  private refreshActiveGoodsCache(): void {
+    this.activeGoodsSet.clear();
+    for (const [goodsId, orderBook] of this.orderBooks) {
+      if (orderBook.activeBuyCount > 0 || orderBook.activeSellCount > 0) {
+        this.activeGoodsSet.add(goodsId);
+      }
+    }
   }
   
   /**

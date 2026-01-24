@@ -81,7 +81,7 @@ export function useChat() {
           `🔬 **Research Evaluation: "${prompt}"**\n\n` +
           `**Feasibility:** ${(feasibility * 100).toFixed(0)}%\n` +
           `**Estimated Cost:** $${(estimatedCost / 100).toLocaleString()}\n` +
-          `**Duration:** ${estimatedTicks} ticks (~${Math.round(estimatedTicks / 24)} days)\n\n` +
+          `**Duration:** ${estimatedTicks} days\n\n` +
           `**Risks:**\n${risks.map(r => `⚠️ ${r}`).join('\n')}\n\n` +
           `**Expected Effects:**\n${potentialEffects.map(e => `✅ ${e}`).join('\n')}\n\n` +
           `**Potential Side Effects:**\n${sideEffects.map(s => `❗ ${s}`).join('\n')}`

@@ -218,7 +218,8 @@ export interface PricePoint {
 }
 
 export class PriceHistoryBuffer extends RingBuffer<PricePoint> {
-  constructor(capacity: number = 720) { // 30天的数据点（1 tick = 1小时）
+  // 1 tick = 1 day，默认保留365天（1年）的数据点
+  constructor(capacity: number = 365) {
     super(capacity);
   }
 

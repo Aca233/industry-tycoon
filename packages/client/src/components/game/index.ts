@@ -18,5 +18,7 @@ export { AutoTradePanel } from './AutoTradePanel';
 export { EconomyCenter } from './EconomyCenter';
 export { SettingsModal } from './SettingsModal';
 export { StockMarket } from './StockMarket';
-// Canvas 图表组件（GPU 加速）
+export { AudioSettingsPanel } from './AudioSettingsPanel';
+// Canvas 图表组件（高性能实时更新）
 export { PriceChartCanvas, PriceChartWrapperCanvas } from './PriceChartCanvas';
+export { SimplePriceChart } from './SimplePriceChart';

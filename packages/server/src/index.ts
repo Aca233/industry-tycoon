@@ -8,7 +8,7 @@ import cors from '@fastify/cors';
 import helmet from '@fastify/helmet';
 import rateLimit from '@fastify/rate-limit';
 import websocket from '@fastify/websocket';
-import { gameRoutes, chatRoutes, researchRoutes, settingsRoutes, stockRoutes } from './routes/index.js';
+import { gameRoutes, chatRoutes, researchRoutes, settingsRoutes, stockRoutes, performanceRoutes } from './routes/index.js';
 import { websocketRoutes, initGameLoopBroadcast } from './routes/websocket.js';
 import { gameLoop } from './services/gameLoop.js';
 import { initializePriceWorkerPool, shutdownWorkerPools, getPriceWorkerPool } from './workers/index.js';
@@ -74,6 +74,7 @@ async function bootstrap() {
   await app.register(researchRoutes);
   await app.register(settingsRoutes);
   await app.register(stockRoutes);
+  await app.register(performanceRoutes);
   
   // Register WebSocket routes for game state sync
   await app.register(websocketRoutes);

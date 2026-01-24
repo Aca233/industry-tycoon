@@ -9,7 +9,7 @@
  */
 
 import { useState, useEffect, useCallback, useMemo, memo } from 'react';
-import { useGameStore, useInventory, useMarketPrices, usePriceHistory, useEconomySelectedGoodsId, type InventoryStockItem } from '../../stores';
+import { useGameStore, useInventory, useMarketPrices, usePriceHistory, useEconomySelectedGoodsId, useCurrentTick, type InventoryStockItem } from '../../stores';
 import { PriceChartWrapperCanvas } from './PriceChartCanvas';
 import { gameWebSocket } from '../../services/websocket';
 import {
@@ -267,6 +267,7 @@ export function EconomyCenter() {
   const inventory = useInventory();
   const marketPrices = useMarketPrices();
   const priceHistory = usePriceHistory();
+  const currentTick = useCurrentTick();  // 订阅 tick 确保组件随 tick 更新
   const externalSelectedGoodsId = useEconomySelectedGoodsId();
   const setEconomySelectedGoodsId = useGameStore((state) => state.setEconomySelectedGoodsId);
   const playerBuildings = useGameStore((state) => state.buildings);
@@ -296,6 +297,7 @@ export function EconomyCenter() {
   const [hasLoaded, setHasLoaded] = useState(false);  // 标记是否已完成首次加载
   const [marketShare, setMarketShare] = useState<MarketShareData | null>(null);  // 市场占比数据
   const [_playerShare, setPlayerShare] = useState<CompanyShare | null>(null);  // 玩家占比（暂未使用）
+  const [marketShareDays, setMarketShareDays] = useState<number>(30);  // 市场份额统计天数
   
   // 下单表单
   const [orderType, setOrderType] = useState<'buy' | 'sell'>('buy');
@@ -362,7 +364,7 @@ export function EconomyCenter() {
         fetch(`/api/v1/games/${gameId}/market/orderbook/${selectedGoodsId}`),
         fetch(`/api/v1/games/${gameId}/market/trades?goodsId=${selectedGoodsId}&limit=15`),
         fetch(`/api/v1/games/${gameId}/orders`),
-        fetch(`/api/v1/games/${gameId}/market/share/${selectedGoodsId}`),
+        fetch(`/api/v1/games/${gameId}/market/share/${selectedGoodsId}?ticks=${marketShareDays}`),
       ]);
       
       if (depthRes.ok) {
@@ -416,7 +418,7 @@ export function EconomyCenter() {
     // 设置定时刷新（静默刷新，不显示加载状态）
     const interval = setInterval(() => fetchMarketData(false), 2000);
     return () => clearInterval(interval);
-  }, [gameId, selectedGoodsId]); // 注意：不依赖 fetchMarketData 避免无限循环
+  }, [gameId, selectedGoodsId, marketShareDays]); // 注意：不依赖 fetchMarketData 避免无限循环
 
   useEffect(() => {
     const price = marketPrices[selectedGoodsId];
@@ -517,7 +519,11 @@ export function EconomyCenter() {
   // ============ 计算派生数据 ============
   const selectedGoods = getGoodsInfo(selectedGoodsId);
   const selectedStock = getInventoryStock(selectedGoodsId);
-  const selectedHistory = priceHistory.get(selectedGoodsId) ?? [];
+  // 使用 currentTick 触发重新计算，确保获取最新的价格历史
+  const selectedHistory = useMemo(() => {
+    // currentTick 变化时重新从 priceHistory 中获取数据
+    return priceHistory.get(selectedGoodsId) ?? [];
+  }, [priceHistory, selectedGoodsId, currentTick]);
   const currentPrice = marketPrices[selectedGoodsId] ?? selectedGoods?.basePrice ?? 0;
   const priceChange = selectedGoods ? ((currentPrice - selectedGoods.basePrice) / selectedGoods.basePrice * 100) : 0;
 
@@ -657,7 +663,25 @@ export function EconomyCenter() {
               <div className="bg-gradient-to-r from-purple-900/30 to-blue-900/30 rounded-lg p-3 border border-purple-600/30">
                 <div className="flex items-center justify-between mb-2">
                   <div className="text-xs text-purple-300 font-medium">📊 市场份额排行榜</div>
-                  <div className="text-xs text-gray-500">近30天销售 · 总量 {marketShare ? marketShare.totalQuantity.toFixed(0) : '0'}</div>
+                  <div className="flex items-center gap-2">
+                    {/* 时间范围选择器 */}
+                    <div className="flex items-center gap-1">
+                      {[7, 30, 90].map((days) => (
+                        <button
+                          key={days}
+                          onClick={() => setMarketShareDays(days)}
+                          className={`px-2 py-0.5 text-[10px] rounded transition-colors ${
+                            marketShareDays === days
+                              ? 'bg-purple-600 text-white'
+                              : 'bg-slate-700/50 text-gray-400 hover:bg-slate-600/50 hover:text-gray-300'
+                          }`}
+                        >
+                          {days}天
+                        </button>
+                      ))}
+                    </div>
+                    <div className="text-xs text-gray-500">总量 {marketShare ? marketShare.totalQuantity.toFixed(0) : '0'}</div>
+                  </div>
                 </div>
                 {marketShare && marketShare.totalQuantity > 0 && marketShare.shares.length > 0 ? (
                   <div className="space-y-1.5 max-h-40 overflow-y-auto">
@@ -747,7 +771,7 @@ export function EconomyCenter() {
             {/* 价格走势图 - 使用 Canvas GPU 加速版本 */}
             <div className="p-4 border-b border-slate-700">
               <div className="text-sm font-medium text-gray-400 mb-2">📈 价格走势</div>
-              <PriceChartWrapperCanvas history={selectedHistory} />
+              <PriceChartWrapperCanvas history={selectedHistory} goodsId={selectedGoodsId} />
             </div>
             
             {/* 生产/消耗建筑 + 标签 */}

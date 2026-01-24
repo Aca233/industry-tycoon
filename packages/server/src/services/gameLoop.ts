@@ -25,6 +25,10 @@ import {
   initializeRegistries,
   getGoodsRegistry,
   getBuilding,
+  getConstructionTime,
+  getConstructionMaterials,
+  calculateConstructionCost,
+  type BuildingDef,
 } from '@scc/shared';
 import { aiCompanyManager, type CompetitionEvent } from './aiCompanyManager.js';
 import { llmService } from './llm.js';
@@ -34,10 +38,12 @@ import { economyManager } from './economyManager.js';
 import { inventoryManager } from './inventoryManager.js';
 import { autoTradeManager } from './autoTradeManager.js';
 import { marketOrderBook } from './marketOrderBook.js';
+import { matchingEngine } from './matchingEngine.js';
 import { stockMarketService } from './stockMarket.js';
 import { aiStockTradingService } from './aiStockTrading.js';
 import { tickSchedulerFactory, TICK_FREQUENCY } from './tickScheduler.js';
 import { getPriceWorkerPool } from '../workers/index.js';
+import { performanceProfiler } from './performanceProfiler.js';
 
 // 创建商品价格查询表
 const GOODS_BASE_PRICES = new Map(GOODS_DATA.map(g => [g.id, g.basePrice]));
@@ -61,13 +67,19 @@ export interface BuildingInstance {
   position: { x: number; y: number };
   efficiency: number;
   utilization: number;
-  status: 'running' | 'paused' | 'no_input' | 'no_power';
+  status: 'running' | 'paused' | 'no_input' | 'no_power' | 'under_construction' | 'waiting_materials';
   /** 当前生产进度 (0 到 ticksRequired) */
   productionProgress: number;
   /** 当前使用的生产方式 ID */
   currentMethodId: string;
   /** 聚合数量：代表多少个相同类型的工厂，默认为1 */
   aggregatedCount?: number;
+  /** 建造进度 (0 到 constructionTime) */
+  constructionProgress?: number;
+  /** 建造所需总时间 */
+  constructionTimeRequired?: number;
+  /** 建造所需材料清单（等待材料状态时使用） */
+  requiredConstructionMaterials?: Array<{ goodsId: string; amount: number }>;
 }
 
 /** 价格历史记录（扩展版：包含OHLC和成交量） */
@@ -233,8 +245,20 @@ export interface TickUpdate {
   buildingShortages?: Array<{
     buildingId: string;
     buildingName: string;
-    status: 'no_input' | 'no_power' | 'paused';
+    status: 'no_input' | 'no_power' | 'paused' | 'waiting_materials';
     missingInputs: Array<{
+      goodsId: string;
+      goodsName: string;
+      needed: number;
+      available: number;
+    }>;
+  }> | undefined;
+  /** 等待建造材料的建筑信息 */
+  buildingMaterialShortages?: Array<{
+    buildingId: string;
+    buildingName: string;
+    status: 'waiting_materials';
+    missingMaterials: Array<{
       goodsId: string;
       goodsName: string;
       needed: number;
@@ -246,6 +270,14 @@ export interface TickUpdate {
     total: number;
     buy: number;
     sell: number;
+  }> | undefined;
+  /** 建筑进度信息（建造中、等待材料的建筑） */
+  buildingsProgress?: Array<{
+    buildingId: string;
+    status: 'under_construction' | 'waiting_materials' | 'running' | 'no_input';
+    constructionProgress?: number;
+    constructionTimeRequired?: number;
+    productionProgress?: number;
   }> | undefined;
 }
 
@@ -263,12 +295,12 @@ export class GameLoop extends EventEmitter {
   
   // Base tick rate: milliseconds per tick at 1x speed
   // 200ms = 5 ticks per second at 1x, 20 ticks per second at 4x
-  // This allows 1 game-month (720 ticks) to pass in 36 seconds at 4x speed
+  // This allows 1 game-month (30 ticks) to pass in 1.5 seconds at 4x speed (1 tick = 1 day)
   private readonly BASE_TICK_MS = 200;
   
-  // 价格历史管理（1 tick = 1小时）
-  private readonly MAX_PRICE_HISTORY_LENGTH = 720; // 保留最近720个tick的历史（30天）
-  private readonly PRICE_HISTORY_CLEANUP_THRESHOLD = 900; // 超过此值才触发清理
+  // 价格历史管理（1 tick = 1天）
+  private readonly MAX_PRICE_HISTORY_LENGTH = 3650; // 保留最近3650个tick的历史（10年）
+  private readonly PRICE_HISTORY_CLEANUP_THRESHOLD = 4000; // 超过此值才触发清理
   
   // ===== 增量更新优化 =====
   // 缓存上一次发送的价格快照，用于计算增量
@@ -370,6 +402,14 @@ export class GameLoop extends EventEmitter {
         0
       );
       console.log('[GameLoop] Player inventory initialized');
+      
+      // ===== 注册增量撮合回调 =====
+      // 将 marketOrderBook 与 matchingEngine 连接起来
+      // 每当有新订单提交时，通知撮合引擎优先处理该商品
+      marketOrderBook.setNewOrderCallback((goodsId, orderId) => {
+        matchingEngine.markNewOrder(goodsId, orderId);
+      });
+      console.log('[GameLoop] Incremental matching callback registered');
       
       // 初始化经济系统
       economyManager.initialize(0);
@@ -503,8 +543,15 @@ export class GameLoop extends EventEmitter {
   /**
    * Purchase a building
    * 支持从 BUILDINGS_DATA 和 BUILDING_DEFINITIONS 两个数据源查找建筑
+   *
+   * 建造系统：
+   * 1. 检查资金是否足够
+   * 2. 检查建造材料是否足够（水泥、钢材、玻璃、铝材等）
+   * 3. 扣除资金和材料
+   * 4. 创建"建造中"状态的建筑
+   * 5. 每tick推进建造进度，完成后转为运营状态
    */
-  purchaseBuilding(gameId: string, buildingDefId: string): { success: boolean; building?: BuildingInstance; error?: string; newCash?: number } {
+  purchaseBuilding(gameId: string, buildingDefId: string): { success: boolean; building?: BuildingInstance; error?: string; newCash?: number; materialsConsumed?: Array<{ goodsId: string; amount: number }>; missingMaterials?: Array<{ goodsId: string; needed: number; available: number }> } {
     const game = this.games.get(gameId);
     if (!game) {
       return { success: false, error: '游戏不存在' };
@@ -524,19 +571,76 @@ export class GameLoop extends EventEmitter {
     const playerInventory = inventoryManager.getInventory(game.playerCompanyId);
     const currentCash = playerInventory?.cash ?? game.playerCash;
     
-    if (currentCash < buildingDef.baseCost) {
-      return { success: false, error: '资金不足' };
+    // ===== 新成本系统：使用动态成本计算（人工成本 + 材料市价） =====
+    // 获取当前市场价格
+    const marketPrices: Record<string, number> = {};
+    for (const [goodsId, price] of game.marketPrices) {
+      marketPrices[goodsId] = price;
     }
     
-    // 同时从游戏状态和库存系统扣减成本
-    game.playerCash -= buildingDef.baseCost;
+    // 计算真实建造成本（材料费 + 人工费）
+    const costResult = calculateConstructionCost(buildingDef as BuildingDef, marketPrices);
+    const laborCost = costResult.laborCost; // 人工成本必须先付
+    
+    // 检查资金是否足够支付人工成本
+    if (currentCash < laborCost) {
+      return { success: false, error: `资金不足，需要 ${(laborCost / 10000).toFixed(0)} 万元人工费` };
+    }
+    
+    // ===== 建造系统：检查建造材料（不再阻止购买，只记录缺失） =====
+    const constructionMaterials = getConstructionMaterials(buildingDef as BuildingDef);
+    const constructionTime = getConstructionTime(buildingDef as BuildingDef);
+    const missingMaterials: Array<{ goodsId: string; needed: number; available: number }> = [];
+    
+    for (const material of constructionMaterials) {
+      const available = inventoryManager.getAvailableQuantity(game.playerCompanyId, material.goodsId);
+      if (available < material.amount) {
+        missingMaterials.push({
+          goodsId: material.goodsId,
+          needed: material.amount,
+          available,
+        });
+      }
+    }
+    
+    // ===== 扣除人工成本（无论材料是否充足都扣除）=====
+    // 注意：只扣除人工成本，材料费通过消耗库存材料来体现
+    game.playerCash -= laborCost;
     if (playerInventory) {
       inventoryManager.deductCash(
         game.playerCompanyId,
-        buildingDef.baseCost,
+        laborCost,
         game.currentTick,
-        `purchase-building-${buildingDefId}`
+        `labor-cost-building-${buildingDefId}`
       );
+    }
+    
+    console.log(`[GameLoop] Building ${buildingDef.nameZh}: Labor cost ¥${(laborCost / 10000).toFixed(0)}万, Material cost ¥${(costResult.materialCost / 10000).toFixed(0)}万 (total ¥${(costResult.totalCost / 10000).toFixed(0)}万)`);
+    
+    // ===== 根据材料状态决定初始状态和是否消耗材料 =====
+    let initialStatus: 'under_construction' | 'waiting_materials';
+    const materialsConsumed: Array<{ goodsId: string; amount: number }> = [];
+    
+    if (missingMaterials.length > 0) {
+      // 材料不足，进入等待材料状态，不消耗材料
+      initialStatus = 'waiting_materials';
+      console.log(`[GameLoop] Building purchase: ${buildingDef.nameZh} - waiting for materials: ${missingMaterials.map(m => `${m.goodsId}(需${m.needed},有${m.available})`).join(', ')}`);
+    } else {
+      // 材料充足，直接开始建造并消耗材料
+      initialStatus = 'under_construction';
+      for (const material of constructionMaterials) {
+        inventoryManager.consumeGoods(
+          game.playerCompanyId,
+          material.goodsId,
+          material.amount,
+          game.currentTick,
+          `construction-${buildingDefId}`
+        );
+        materialsConsumed.push({ goodsId: material.goodsId, amount: material.amount });
+        
+        // 建造消耗也增加市场需求
+        this.addDemand(game, material.goodsId, material.amount);
+      }
     }
     
     // 获取默认生产方式
@@ -554,11 +658,20 @@ export class GameLoop extends EventEmitter {
       },
       efficiency: 1.0,
       utilization: 1.0, // 满负荷运行
-      status: 'running',
+      status: initialStatus, // 根据材料状态决定
       productionProgress: 0,
       currentMethodId: defaultMethodId,
       aggregatedCount: 1, // 玩家建筑默认为1（不聚合）
+      constructionTimeRequired: constructionTime,
     };
+    
+    // 根据状态设置可选属性（避免 exactOptionalPropertyTypes 问题）
+    if (initialStatus === 'under_construction') {
+      building.constructionProgress = 0;
+    }
+    if (missingMaterials.length > 0) {
+      building.requiredConstructionMaterials = constructionMaterials;
+    }
     
     game.buildings.push(building);
     
@@ -613,15 +726,57 @@ export class GameLoop extends EventEmitter {
       }
     }
     
+    // ===== 为建造材料配置自动采购（如果处于等待材料状态）=====
+    if (missingMaterials.length > 0) {
+      for (const material of constructionMaterials) {
+        // 建造材料采购策略：一次性大量采购
+        const triggerThreshold = Math.ceil(material.amount * 0.5); // 低于需求的50%时触发
+        const targetStock = Math.ceil(material.amount * 2); // 目标是需求的2倍（留有余量）
+        
+        autoTradeManager.updateGoodsConfig(game.playerCompanyId, material.goodsId, {
+          autoBuy: {
+            enabled: true,
+            triggerThreshold: triggerThreshold,
+            targetStock: targetStock,
+            maxPriceMultiplier: 1.20, // 建造材料可以接受更高溢价（20%）
+          },
+        });
+        console.log(`[GameLoop] 自动配置建造材料采购: ${material.goodsId} (需${material.amount}, 阈值: ${triggerThreshold}, 目标: ${targetStock})`);
+      }
+    }
+    
     // 同步玩家现金
     const updatedInventory = inventoryManager.getInventory(game.playerCompanyId);
     if (updatedInventory) {
       game.playerCash = updatedInventory.cash;
     }
     
-    console.log(`[GameLoop] Building purchased: ${buildingDef.nameZh}, new cash: ${game.playerCash}`);
+    if (initialStatus === 'waiting_materials') {
+      console.log(`[GameLoop] Building purchased (waiting for materials): ${buildingDef.nameZh}`);
+    } else {
+      console.log(`[GameLoop] Building construction started: ${buildingDef.nameZh}, time: ${constructionTime} ticks, materials: ${materialsConsumed.map(m => `${m.goodsId}x${m.amount}`).join(', ')}`);
+    }
     
-    return { success: true, building, newCash: game.playerCash };
+    // 构建返回结果（避免 exactOptionalPropertyTypes 问题）
+    const result: {
+      success: boolean;
+      building?: BuildingInstance;
+      error?: string;
+      newCash?: number;
+      materialsConsumed?: Array<{ goodsId: string; amount: number }>;
+      missingMaterials?: Array<{ goodsId: string; needed: number; available: number }>;
+    } = {
+      success: true,
+      building,
+      newCash: game.playerCash,
+      materialsConsumed,
+    };
+    
+    if (missingMaterials.length > 0) {
+      result.missingMaterials = missingMaterials;
+    }
+    
+    return result;
   }
   
   /**
@@ -753,12 +908,34 @@ export class GameLoop extends EventEmitter {
     const tickStartTime = Date.now();
     const scheduler = tickSchedulerFactory.getScheduler(gameId);
     
+    // === 诊断日志：每10tick输出一次基础状态 ===
+    if (game.currentTick % 10 === 0) {
+      console.log(`[GameLoop] ========== TICK ${game.currentTick + 1} ==========`);
+      console.log(`[GameLoop] 建筑数量: ${game.buildings.length}`);
+      if (game.buildings.length > 0) {
+        for (const b of game.buildings) {
+          console.log(`[GameLoop]   - ${b.name}: 状态=${b.status}, 进度=${b.productionProgress?.toFixed(1) || 0}`);
+        }
+      } else {
+        console.log(`[GameLoop] ⚠️ 警告: 玩家没有任何建筑!`);
+      }
+    }
+    
+    // 开始性能采样
+    performanceProfiler.startTick(game.currentTick + 1, {
+      buildingCount: game.buildings.length,
+      activeOrders: marketOrderBook.getOrderBookStats().totalBuyOrders + marketOrderBook.getOrderBookStats().totalSellOrders,
+      aiCompanyCount: aiCompanyManager.getCompanies().size,
+    });
+    
     // Advance tick
     game.currentTick++;
     game.lastUpdate = tickStartTime;
     
     // ===== 高频操作：订单撮合和价格发现（每tick）=====
+    performanceProfiler.startPhase('economyUpdate');
     const economyResult = this.processHighFrequencyOperations(game, scheduler);
+    performanceProfiler.endPhase('economyUpdate');
     
     // ===== 低频操作：诊断日志 =====
     if (scheduler.shouldExecute(game.currentTick, 'DIAGNOSTIC_LOG')) {
@@ -772,8 +949,10 @@ export class GameLoop extends EventEmitter {
     }
     
     // ===== 高频操作：建筑生产（每tick）=====
+    performanceProfiler.startPhase('buildingProduction');
     const { totalIncome, totalInputCost, totalMaintenance, buildingProfits } =
       this.processBuildingProduction(game, scheduler);
+    performanceProfiler.endPhase('buildingProduction');
     
     // ===== 低频操作：建筑状态诊断 =====
     if (scheduler.shouldExecute(game.currentTick, 'BUILDING_DIAGNOSTIC') && game.buildings.length > 0) {
@@ -938,6 +1117,7 @@ export class GameLoop extends EventEmitter {
     // ===== 中频操作：AI公司决策 =====
     let aiResult = { events: [] as CompetitionEvent[], news: [] as Array<{ companyId: string; headline: string }> };
     if (scheduler.shouldExecute(game.currentTick, 'AI_COMPANY_DECISION')) {
+      performanceProfiler.startPhase('aiCompanyDecision');
       const aiContext = {
         currentTick: game.currentTick,
         marketPrices: game.marketPrices,
@@ -972,10 +1152,12 @@ export class GameLoop extends EventEmitter {
           }
         }
       }
+      performanceProfiler.endPhase('aiCompanyDecision');
     }
     
     // ===== 中频操作：股票市场 =====
     if (scheduler.shouldExecute(game.currentTick, 'STOCK_MARKET_UPDATE')) {
+      performanceProfiler.startPhase('stockMarket');
       // 收集公司财务数据用于股价计算
       const companyFinancials = new Map<string, { cash: number; netIncome: number; totalAssets: number }>();
       
@@ -984,7 +1166,7 @@ export class GameLoop extends EventEmitter {
       if (playerInventoryForStock) {
         companyFinancials.set(game.playerCompanyId, {
           cash: playerInventoryForStock.cash,
-          netIncome: netProfit * 720, // 转换为月收益估算
+          netIncome: netProfit * 30, // 转换为月收益估算（1 tick = 1天）
           totalAssets: playerInventoryForStock.cash, // 简化处理
         });
       }
@@ -1000,6 +1182,7 @@ export class GameLoop extends EventEmitter {
       
       // 更新股票市场（撮合订单、更新股价）
       stockMarketService.processTick(game.currentTick, companyFinancials);
+      performanceProfiler.endPhase('stockMarket');
     }
     
     // ===== 中频操作：AI股票交易 =====
@@ -1136,55 +1319,114 @@ export class GameLoop extends EventEmitter {
       game.marketPrices
     );
     
-    // 收集建筑短缺信息
+    // 收集建筑短缺信息 - 检查所有建筑的原料可用性（不仅仅是已停工的）
     const buildingShortages: TickUpdate['buildingShortages'] = [];
+    // 收集等待材料建筑的信息
+    const buildingMaterialShortages: TickUpdate['buildingMaterialShortages'] = [];
+    
     for (const building of game.buildings) {
-      if (building.status === 'no_input' || building.status === 'no_power' || building.status === 'paused') {
-        const def = BUILDINGS_DATA.find(b => b.id === building.definitionId);
-        if (!def) continue;
-        
-        const slot = def.productionSlots[0];
-        const method = slot?.methods.find(m => m.id === building.currentMethodId) ?? slot?.methods[0];
-        if (!method) continue;
-        
-        // 获取技术效果修饰符
-        const techModifiers = technologyEffectManager.getBuildingModifiers(
-          building.definitionId,
-          def.category
-        );
-        
-        // 检查缺少的原料
-        const missingInputs: Array<{
+      // 获取建筑定义和当前生产方式
+      const def = BUILDINGS_DATA.find(b => b.id === building.definitionId);
+      if (!def) continue;
+      
+      // 处理等待材料状态的建筑
+      if (building.status === 'waiting_materials') {
+        const constructionMaterials = building.requiredConstructionMaterials ?? getConstructionMaterials(def);
+        const missingMaterials: Array<{
           goodsId: string;
           goodsName: string;
           needed: number;
           available: number;
         }> = [];
         
-        for (const input of method.recipe.inputs) {
-          const adjustedAmount = input.amount * techModifiers.inputMultiplier;
-          const available = inventoryManager.getAvailableQuantity(game.playerCompanyId, input.goodsId);
-          if (available < adjustedAmount) {
-            // 查找商品名称
-            const goodsDef = GOODS_DATA.find(g => g.id === input.goodsId);
-            missingInputs.push({
-              goodsId: input.goodsId,
-              goodsName: goodsDef?.nameZh ?? input.goodsId,
-              needed: adjustedAmount,
+        for (const material of constructionMaterials) {
+          const available = inventoryManager.getAvailableQuantity(game.playerCompanyId, material.goodsId);
+          if (available < material.amount) {
+            const goodsDef = GOODS_DATA.find(g => g.id === material.goodsId);
+            missingMaterials.push({
+              goodsId: material.goodsId,
+              goodsName: goodsDef?.nameZh ?? material.goodsId,
+              needed: material.amount,
               available,
             });
           }
         }
         
-        // 只有确实缺少原料时才记录
-        if (missingInputs.length > 0 || building.status === 'no_power' || building.status === 'paused') {
-          buildingShortages.push({
-            buildingId: building.id,
-            buildingName: building.name,
-            status: building.status as 'no_input' | 'no_power' | 'paused',
-            missingInputs,
+        // 即使材料已齐全（即将开始建造），也报告当前状态
+        buildingMaterialShortages.push({
+          buildingId: building.id,
+          buildingName: building.name,
+          status: 'waiting_materials',
+          missingMaterials,
+        });
+        
+        // 同时添加到 buildingShortages 以便 UI 统一显示
+        buildingShortages.push({
+          buildingId: building.id,
+          buildingName: building.name,
+          status: 'waiting_materials',
+          missingInputs: missingMaterials,
+        });
+        
+        continue; // 等待材料的建筑不需要检查生产原料
+      }
+      
+      const slot = def.productionSlots[0];
+      const method = slot?.methods.find(m => m.id === building.currentMethodId) ?? slot?.methods[0];
+      if (!method) continue;
+      
+      // 获取技术效果修饰符
+      const techModifiers = technologyEffectManager.getBuildingModifiers(
+        building.definitionId,
+        def.category
+      );
+      
+      // 获取聚合因子（默认为1）- 与 processBuildingProduction 保持一致
+      const aggregatedCount = building.aggregatedCount ?? 1;
+      
+      // 检查缺少的原料 - 使用与 processBuildingProduction 完全相同的计算方式
+      const missingInputs: Array<{
+        goodsId: string;
+        goodsName: string;
+        needed: number;
+        available: number;
+      }> = [];
+      
+      for (const input of method.recipe.inputs) {
+        // 重要：这里要乘以 aggregatedCount，与 processBuildingProduction 保持一致
+        const adjustedAmount = input.amount * techModifiers.inputMultiplier * aggregatedCount;
+        const available = inventoryManager.getAvailableQuantity(game.playerCompanyId, input.goodsId);
+        if (available < adjustedAmount) {
+          // 查找商品名称
+          const goodsDef = GOODS_DATA.find(g => g.id === input.goodsId);
+          missingInputs.push({
+            goodsId: input.goodsId,
+            goodsName: goodsDef?.nameZh ?? input.goodsId,
+            needed: adjustedAmount,
+            available,
           });
         }
+      }
+      
+      // 如果有任何短缺，报告建筑
+      // 注意：即使 building.status 是 'running'，如果实际缺料也要报告
+      // 这确保客户端能立即得知短缺状态
+      if (missingInputs.length > 0) {
+        buildingShortages.push({
+          buildingId: building.id,
+          buildingName: building.name,
+          // 如果有缺料，报告为 no_input；否则使用实际状态
+          status: 'no_input',
+          missingInputs,
+        });
+      } else if (building.status === 'no_power' || building.status === 'paused') {
+        // 没有缺料但处于其他停工状态
+        buildingShortages.push({
+          buildingId: building.id,
+          buildingName: building.name,
+          status: building.status as 'no_power' | 'paused',
+          missingInputs: [],
+        });
       }
     }
     
@@ -1192,6 +1434,32 @@ export class GameLoop extends EventEmitter {
     const tickVolumesRecord: Record<string, { total: number; buy: number; sell: number }> = {};
     for (const [goodsId, vol] of tickVolumeByGoods) {
       tickVolumesRecord[goodsId] = vol;
+    }
+    
+    // 收集建筑进度信息（用于实时更新前端建造进度）
+    const buildingsProgress: TickUpdate['buildingsProgress'] = [];
+    for (const building of game.buildings) {
+      // 只包含需要更新进度的建筑（建造中、等待材料、停工）
+      if (building.status === 'under_construction' ||
+          building.status === 'waiting_materials' ||
+          building.status === 'no_input') {
+        // 构建进度对象，避免 exactOptionalPropertyTypes 问题
+        const progressEntry: NonNullable<TickUpdate['buildingsProgress']>[number] = {
+          buildingId: building.id,
+          status: building.status,
+        };
+        // 只有在值存在时才添加可选属性
+        if (building.constructionProgress !== undefined) {
+          progressEntry.constructionProgress = building.constructionProgress;
+        }
+        if (building.constructionTimeRequired !== undefined) {
+          progressEntry.constructionTimeRequired = building.constructionTimeRequired;
+        }
+        if (building.productionProgress !== undefined) {
+          progressEntry.productionProgress = building.productionProgress;
+        }
+        buildingsProgress.push(progressEntry);
+      }
     }
     
     // Emit tick update
@@ -1224,8 +1492,18 @@ export class GameLoop extends EventEmitter {
       },
       ...(inventorySnapshot ? { inventory: inventorySnapshot } : {}),
       ...(buildingShortages.length > 0 ? { buildingShortages } : {}),
+      ...(buildingMaterialShortages.length > 0 ? { buildingMaterialShortages } : {}),
       ...(Object.keys(tickVolumesRecord).length > 0 ? { tickVolumes: tickVolumesRecord } : {}),
+      ...(buildingsProgress.length > 0 ? { buildingsProgress } : {}),
     };
+    
+    // 结束性能采样
+    performanceProfiler.endTick();
+    
+    // 每100 tick输出一次性能报告
+    if (game.currentTick % 100 === 0) {
+      performanceProfiler.logReport(100);
+    }
     
     this.emit('tick', update);
   }
@@ -1372,11 +1650,35 @@ export class GameLoop extends EventEmitter {
     let totalMaintenance = 0;
     const buildingProfits: BuildingProfit[] = [];
     
-    const TICKS_PER_MONTH = 720; // 30天 × 24小时
+    const TICKS_PER_MONTH = 30; // 1 tick = 1天，30天/月
+    
+    // === 诊断日志：每100tick输出一次建筑处理摘要 ===
+    const shouldLogDiagnostics = game.currentTick % 100 === 1;
+    if (shouldLogDiagnostics && game.buildings.length > 0) {
+      console.log(`\n[BuildingProduction] ===== tick ${game.currentTick} 建筑生产诊断 =====`);
+      console.log(`[BuildingProduction] 玩家建筑总数: ${game.buildings.length}`);
+    }
     
     for (const building of game.buildings) {
       const def = BUILDINGS_DATA.find(b => b.id === building.definitionId);
-      if (!def) continue;
+      if (!def) {
+        if (shouldLogDiagnostics) {
+          console.log(`[BuildingProduction] ⚠️ 建筑 ${building.id} 定义未找到: ${building.definitionId}`);
+        }
+        continue;
+      }
+      
+      // === 诊断日志：输出每个建筑的状态 ===
+      if (shouldLogDiagnostics) {
+        console.log(`[BuildingProduction] 建筑: ${building.name} (${building.id})`);
+        console.log(`  - 状态: ${building.status}`);
+        console.log(`  - 定义ID: ${building.definitionId}`);
+        console.log(`  - 生产进度: ${building.productionProgress}`);
+        console.log(`  - 效率: ${building.efficiency}, 利用率: ${building.utilization}`);
+        if (building.constructionProgress !== undefined) {
+          console.log(`  - 建造进度: ${building.constructionProgress}/${building.constructionTimeRequired}`);
+        }
+      }
       
       // 获取当前生产方式
       const slot = def.productionSlots[0];
@@ -1398,11 +1700,12 @@ export class GameLoop extends EventEmitter {
       
       // 维护成本每 tick 都产生
       // 重要改进：停工建筑（no_input/no_power）只收取50%维护费
+      // 等待材料状态收取25%维护费
       // 维护成本 × 聚合因子（代表多个工厂）
       let maintenanceMultiplier = 1.0;
       if (building.status === 'no_input' || building.status === 'no_power') {
         maintenanceMultiplier = 0.5;
-      } else if (building.status === 'paused') {
+      } else if (building.status === 'paused' || building.status === 'waiting_materials') {
         maintenanceMultiplier = 0.25;
       }
       const buildingMaintenance = (def.maintenanceCost / TICKS_PER_MONTH) * techModifiers.costMultiplier * maintenanceMultiplier * aggregatedCount;
@@ -1412,8 +1715,105 @@ export class GameLoop extends EventEmitter {
       let buildingInputCost = 0;
       let produced = false;
       
+      // 处理等待材料的建筑
+      if (building.status === 'waiting_materials') {
+        // 获取建造所需材料
+        const constructionMaterials = building.requiredConstructionMaterials ?? getConstructionMaterials(def);
+        const constructionTime = getConstructionTime(def);
+        
+        // 检查材料是否齐全，同时收集缺失材料
+        let hasAllMaterials = true;
+        const missingMaterialsList: Array<{ goodsId: string; needed: number; available: number }> = [];
+        for (const material of constructionMaterials) {
+          const available = inventoryManager.getAvailableQuantity(game.playerCompanyId, material.goodsId);
+          if (available < material.amount) {
+            hasAllMaterials = false;
+            missingMaterialsList.push({
+              goodsId: material.goodsId,
+              needed: material.amount,
+              available,
+            });
+          }
+        }
+        
+        // 如果有缺失材料，触发自动采购
+        if (!hasAllMaterials && missingMaterialsList.length > 0) {
+          this.autoPurchaseConstructionMaterials(game, building, missingMaterialsList);
+        }
+        
+        if (hasAllMaterials) {
+          // 消耗材料
+          for (const material of constructionMaterials) {
+            inventoryManager.consumeGoods(
+              game.playerCompanyId,
+              material.goodsId,
+              material.amount,
+              game.currentTick,
+              `construction-${building.id}`
+            );
+            // 增加市场需求
+            this.addDemand(game, material.goodsId, material.amount);
+          }
+          
+          // 转换为建造中状态
+          building.status = 'under_construction';
+          building.constructionProgress = 0;
+          building.constructionTimeRequired = constructionTime;
+          delete building.requiredConstructionMaterials;
+          
+          console.log(`[GameLoop] Building ${building.name} started construction - materials collected`);
+        }
+        
+        // 等待材料状态：不产生收益，只收取25%维护费
+        buildingProfits.push({
+          buildingId: building.id,
+          name: building.name + ' (等待材料)',
+          income: 0,
+          inputCost: 0,
+          maintenance: buildingMaintenance,
+          net: -buildingMaintenance,
+          produced: false,
+          avgNet: 0,
+        });
+        continue; // 跳过生产逻辑
+      }
+      
+      // 处理建造中的建筑
+      if (building.status === 'under_construction') {
+        // 推进建造进度
+        building.constructionProgress = (building.constructionProgress ?? 0) + 1;
+        const constructionTimeRequired = building.constructionTimeRequired ?? 24;
+        
+        if (building.constructionProgress >= constructionTimeRequired) {
+          // 建造完成，转为运营状态
+          building.status = 'running';
+          // 使用 delete 操作符移除可选属性，避免 exactOptionalPropertyTypes 错误
+          delete building.constructionProgress;
+          delete building.constructionTimeRequired;
+          console.log(`[GameLoop] Building construction completed: ${building.name} (${building.id})`);
+        }
+        
+        // 建造中不产生收益也不消耗资源（只收维护费的50%）
+        buildingProfits.push({
+          buildingId: building.id,
+          name: building.name + ' (建造中)',
+          income: 0,
+          inputCost: 0,
+          maintenance: buildingMaintenance,
+          net: -buildingMaintenance,
+          produced: false,
+          avgNet: 0,
+        });
+        continue; // 跳过生产逻辑
+      }
+      
       // 只有 running 状态的建筑才进行生产
       if (building.status === 'running') {
+        // === 诊断日志：running状态建筑的生产处理 ===
+        if (shouldLogDiagnostics) {
+          console.log(`[BuildingProduction] 🏭 ${building.name} 进入生产处理`);
+          console.log(`  - 配方: ${recipe.inputs.length}输入 → ${recipe.outputs.length}输出, ${recipe.ticksRequired}tick/周期`);
+        }
         // 检查原料是否充足
         let hasAllInputsForProduction = true;
         const missingInputsCheck: Array<{ goodsId: string; needed: number; available: number }> = [];
@@ -1445,6 +1845,9 @@ export class GameLoop extends EventEmitter {
           if (building.productionProgress >= recipe.ticksRequired) {
             building.productionProgress -= recipe.ticksRequired;
             produced = true;
+            
+            // === 诊断日志：生产周期完成 ===
+            console.log(`[BuildingProduction] ✅ ${building.name} 完成一个生产周期!`);
             
             // 再次检查并消耗库存中的原料
             let hasAllInputs = true;
@@ -1478,6 +1881,10 @@ export class GameLoop extends EventEmitter {
                 const price = this.getPrice(game, output.goodsId);
                 const adjustedAmount = output.amount * techModifiers.outputMultiplier * aggregatedCount;
                 const productionCost = buildingInputCost / recipe.outputs.length;
+                
+                // === 诊断日志：产出详情 ===
+                console.log(`[BuildingProduction] 📦 产出: ${output.goodsId} x${adjustedAmount.toFixed(1)} (基础${output.amount} × 修饰符${techModifiers.outputMultiplier.toFixed(2)} × 聚合${aggregatedCount})`);
+                
                 inventoryManager.addGoods(
                   game.playerCompanyId,
                   output.goodsId,
@@ -1488,6 +1895,10 @@ export class GameLoop extends EventEmitter {
                 );
                 buildingIncome += adjustedAmount * price;
                 this.addSupply(game, output.goodsId, adjustedAmount);
+                
+                // === 诊断日志：确认库存更新 ===
+                const newQty = inventoryManager.getAvailableQuantity(game.playerCompanyId, output.goodsId);
+                console.log(`[BuildingProduction] 📊 库存更新后: ${output.goodsId} = ${newQty.toFixed(1)}`);
               }
             } else {
               building.status = 'no_input';
@@ -1637,7 +2048,7 @@ export class GameLoop extends EventEmitter {
     
     // 需求波动参数
     const amplitude = MARKET_CONSTANTS?.DEMAND_FLUCTUATION_AMPLITUDE ?? 0.3;
-    const cycleLength = MARKET_CONSTANTS?.DEMAND_FLUCTUATION_CYCLE ?? 720;
+    const cycleLength = MARKET_CONSTANTS?.DEMAND_FLUCTUATION_CYCLE ?? 30;
     
     // 为每种商品增加基础需求（带周期性波动）
     let phaseOffset = 0;
@@ -1694,7 +2105,7 @@ export class GameLoop extends EventEmitter {
     };
     
     const amplitude = MARKET_CONSTANTS?.DEMAND_FLUCTUATION_AMPLITUDE ?? 0.3;
-    const cycleLength = MARKET_CONSTANTS?.DEMAND_FLUCTUATION_CYCLE ?? 720;
+    const cycleLength = MARKET_CONSTANTS?.DEMAND_FLUCTUATION_CYCLE ?? 30;
     
     let phaseOffset = 0;
     for (const [goodsId, baseDemand] of Object.entries(BASE_CONSUMER_DEMAND)) {
@@ -1821,6 +2232,78 @@ export class GameLoop extends EventEmitter {
         // 记录订单ID以追踪
         this.pendingPurchaseOrders.set(trackingKey, result.order.id);
         console.log(`[GameLoop] 自动采购: ${building.name} 购买 ${purchaseAmount.toFixed(0)} ${missing.goodsId} @ ${maxPrice.toFixed(0)} (限价${(purchaseAmount / desiredPurchaseAmount * 100).toFixed(0)}%)`);
+      }
+    }
+  }
+  
+  /**
+   * 自动采购建造材料
+   * 为等待材料的建筑提交市场买单
+   */
+  private autoPurchaseConstructionMaterials(
+    game: GameState,
+    building: BuildingInstance,
+    missingMaterials: Array<{ goodsId: string; needed: number; available: number }>
+  ): void {
+    const playerInventory = inventoryManager.getInventory(game.playerCompanyId);
+    if (!playerInventory) return;
+    
+    // 资金保护机制
+    const CASH_PROTECTION_THRESHOLD = 50000000; // 5000万
+    if (playerInventory.cash < CASH_PROTECTION_THRESHOLD) {
+      if (game.currentTick % 100 === 0) {
+        console.log(`[GameLoop] ⚠️ 建造材料采购: 资金保护中，现金(${(playerInventory.cash / 1000000).toFixed(1)}M) < 阈值(${CASH_PROTECTION_THRESHOLD / 1000000}M)`);
+      }
+      return;
+    }
+    
+    const MAX_SPEND_RATIO = 0.3;
+    const maxSpendPerOrder = playerInventory.cash * MAX_SPEND_RATIO;
+    
+    for (const missing of missingMaterials) {
+      const shortage = missing.needed - missing.available;
+      if (shortage <= 0) continue;
+      
+      // 生成追踪键
+      const trackingKey = `construction-${building.id}-${missing.goodsId}`;
+      
+      // 检查是否已有未成交的采购订单
+      const existingOrderId = this.pendingPurchaseOrders.get(trackingKey);
+      if (existingOrderId) {
+        const existingOrder = marketOrderBook.getOrder(existingOrderId);
+        if (existingOrder && (existingOrder.status === 'open' || existingOrder.status === 'partial')) {
+          continue;
+        } else {
+          this.pendingPurchaseOrders.delete(trackingKey);
+        }
+      }
+      
+      const marketPrice = this.getPrice(game, missing.goodsId);
+      const maxPrice = marketPrice * 1.20; // 建造材料溢价20%
+      
+      // 采购刚好需要的量
+      const desiredPurchaseAmount = Math.ceil(shortage);
+      const affordableByLimit = Math.floor(maxSpendPerOrder / maxPrice);
+      const purchaseAmount = Math.min(desiredPurchaseAmount, affordableByLimit);
+      
+      if (purchaseAmount < 1) {
+        console.log(`[GameLoop] 建造材料采购: 资金不足购买 ${missing.goodsId}`);
+        continue;
+      }
+      
+      const totalCost = maxPrice * purchaseAmount;
+      if (playerInventory.cash < totalCost) continue;
+      
+      const result = economyManager.playerSubmitBuyOrder(
+        game.playerCompanyId,
+        missing.goodsId,
+        purchaseAmount,
+        maxPrice
+      );
+      
+      if (result.success && result.order) {
+        this.pendingPurchaseOrders.set(trackingKey, result.order.id);
+        console.log(`[GameLoop] 建造材料采购: ${building.name} 购买 ${purchaseAmount} ${missing.goodsId} @ ${maxPrice.toFixed(0)}`);
       }
     }
   }
@@ -2083,11 +2566,13 @@ export class GameLoop extends EventEmitter {
     console.log(`📦 玩家库存: ${stockSummary.length > 0 ? stockSummary.join(', ') : '无'}`);
     
     // 3. 建筑状态统计
-    const statusCounts = { running: 0, paused: 0, no_input: 0, no_power: 0 };
+    const statusCounts = { running: 0, paused: 0, no_input: 0, no_power: 0, under_construction: 0 };
     for (const building of game.buildings) {
-      statusCounts[building.status]++;
+      if (building.status in statusCounts) {
+        statusCounts[building.status as keyof typeof statusCounts]++;
+      }
     }
-    console.log(`🏭 建筑状态: 运行=${statusCounts.running}, 缺料=${statusCounts.no_input}, 暂停=${statusCounts.paused}, 缺电=${statusCounts.no_power}`);
+    console.log(`🏭 建筑状态: 运行=${statusCounts.running}, 缺料=${statusCounts.no_input}, 暂停=${statusCounts.paused}, 缺电=${statusCounts.no_power}, 建造中=${statusCounts.under_construction}`);
     
     // 4. 市场订单统计
     const orderStats = marketOrderBook.getOrderBookStats();

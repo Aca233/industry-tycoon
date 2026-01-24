@@ -64,6 +64,21 @@ function saveConfig(config: LLMConfig): void {
 // 当前运行时配置
 let currentConfig = loadConfig();
 
+/** LLM是否启用（API Key有效时启用）*/
+let llmEnabled = !!(currentConfig.apiKey && currentConfig.apiKey.length > 10);
+
+/** API调用连续失败次数 */
+let consecutiveFailures = 0;
+
+/** 失败次数阈值：超过此值自动禁用LLM */
+const FAILURE_THRESHOLD = 3;
+
+/** 自动禁用冷却时间（毫秒）- 10分钟 */
+const AUTO_DISABLE_COOLDOWN = 10 * 60 * 1000;
+
+/** 上次自动禁用的时间 */
+let lastAutoDisableTime = 0;
+
 // 创建 OpenAI 客户端
 let openai = new OpenAI({
   apiKey: currentConfig.apiKey || 'sk-placeholder',
@@ -72,6 +87,7 @@ let openai = new OpenAI({
 
 console.log(`[LLM] Initializing with base URL: ${currentConfig.baseUrl}`);
 console.log(`[LLM] Using model: ${currentConfig.model}`);
+console.log(`[LLM] LLM enabled: ${llmEnabled} (API Key ${currentConfig.apiKey ? 'provided' : 'missing'})`);
 
 export interface ChatContext {
   gameId: string;
@@ -150,21 +166,114 @@ export interface StrategicAnalysisRequest {
  */
 export class LLMService {
   /**
+   * 检查LLM是否启用
+   */
+  isEnabled(): boolean {
+    return llmEnabled;
+  }
+  
+  /**
+   * 手动禁用LLM（用于性能优化或API Key无效时）
+   */
+  disable(): void {
+    llmEnabled = false;
+    consecutiveFailures = 0;
+    console.log('[LLM] LLM service disabled manually');
+  }
+  
+  /**
+   * 手动启用LLM
+   */
+  enable(): void {
+    if (currentConfig.apiKey && currentConfig.apiKey.length > 10) {
+      llmEnabled = true;
+      consecutiveFailures = 0;
+      lastAutoDisableTime = 0;
+      console.log('[LLM] LLM service enabled');
+    } else {
+      console.log('[LLM] Cannot enable LLM: API Key not configured');
+    }
+  }
+  
+  /**
+   * 获取失败统计信息
+   */
+  getFailureStats(): { consecutiveFailures: number; isAutoDisabled: boolean; cooldownRemaining: number } {
+    const now = Date.now();
+    const cooldownRemaining = lastAutoDisableTime > 0
+      ? Math.max(0, AUTO_DISABLE_COOLDOWN - (now - lastAutoDisableTime))
+      : 0;
+    return {
+      consecutiveFailures,
+      isAutoDisabled: lastAutoDisableTime > 0 && cooldownRemaining > 0,
+      cooldownRemaining,
+    };
+  }
+  
+  /**
+   * 记录API调用成功
+   */
+  private recordSuccess(): void {
+    consecutiveFailures = 0;
+  }
+  
+  /**
+   * 记录API调用失败，如果连续失败超过阈值则自动禁用
+   */
+  private recordFailure(error: Error): void {
+    consecutiveFailures++;
+    
+    // 检查是否是认证错误（401）
+    const isAuthError = error.message.includes('401') ||
+                        error.message.includes('authentication') ||
+                        error.message.includes('API 密钥');
+    
+    if (isAuthError || consecutiveFailures >= FAILURE_THRESHOLD) {
+      llmEnabled = false;
+      lastAutoDisableTime = Date.now();
+      console.log(`[LLM] Auto-disabled after ${consecutiveFailures} consecutive failures. Will retry after ${AUTO_DISABLE_COOLDOWN / 60000} minutes.`);
+      console.log(`[LLM] Last error: ${error.message}`);
+    }
+  }
+  
+  /**
+   * 检查是否应该尝试API调用（考虑自动禁用冷却期）
+   */
+  private shouldAttemptApiCall(): boolean {
+    if (!llmEnabled) {
+      // 检查冷却期是否已过
+      if (lastAutoDisableTime > 0) {
+        const now = Date.now();
+        if (now - lastAutoDisableTime >= AUTO_DISABLE_COOLDOWN) {
+          // 冷却期已过，重新启用并尝试
+          llmEnabled = true;
+          consecutiveFailures = 0;
+          console.log('[LLM] Cooldown period ended, re-enabling LLM service');
+          return true;
+        }
+      }
+      return false;
+    }
+    return true;
+  }
+
+  /**
    * 获取当前配置（隐藏API Key的大部分内容）
    */
-  getConfig(): LLMConfig & { apiKeyMasked: string } {
+  getConfig(): LLMConfig & { apiKeyMasked: string; enabled: boolean } {
     return {
       apiKey: currentConfig.apiKey,
       baseUrl: currentConfig.baseUrl,
       model: currentConfig.model,
       apiKeyMasked: this.maskApiKey(currentConfig.apiKey),
+      enabled: llmEnabled,
     };
   }
 
   /**
    * 更新配置
    */
-  updateConfig(newConfig: Partial<LLMConfig>): void {
+  updateConfig(newConfig: Partial<LLMConfig & { enabled?: boolean }>): void {
     // 合并配置
     if (newConfig.apiKey !== undefined) {
       currentConfig.apiKey = newConfig.apiKey;
@@ -174,6 +283,14 @@ export class LLMService {
     }
     if (newConfig.model !== undefined) {
       currentConfig.model = newConfig.model;
+    }
+    
+    // 更新启用状态
+    if (newConfig.enabled !== undefined) {
+      llmEnabled = newConfig.enabled;
+    } else {
+      // 根据API Key自动更新启用状态
+      llmEnabled = !!(currentConfig.apiKey && currentConfig.apiKey.length > 10);
     }
 
     // 重新创建 OpenAI 客户端
@@ -185,7 +302,7 @@ export class LLMService {
     // 保存到文件
     saveConfig(currentConfig);
 
-    console.log(`[LLM] Config updated - baseUrl: ${currentConfig.baseUrl}, model: ${currentConfig.model}`);
+    console.log(`[LLM] Config updated - baseUrl: ${currentConfig.baseUrl}, model: ${currentConfig.model}, enabled: ${llmEnabled}`);
   }
 
   /**
@@ -512,7 +629,7 @@ export class LLMService {
 请从以下角度评估：
 1. 可行性（0-1）
 2. 预估成本（元）
-3. 研发周期（游戏刻度，1刻度=1小时）
+3. 研发周期（游戏刻度，1刻度=1天）
 4. 潜在风险
 5. 对生产/市场的预期影响
 6. 可能在后期出现的隐藏副作用（发挥创意，保持现实）
@@ -521,7 +638,7 @@ export class LLMService {
 {
   "feasibility": 0.7,
   "estimatedCost": 50000000,
-  "estimatedTicks": 720,
+  "estimatedTicks": 30,
   "risks": ["..."],
   "potentialEffects": ["..."],
   "sideEffects": ["..."]
@@ -543,7 +660,7 @@ export class LLMService {
       return {
         feasibility: 0.5,
         estimatedCost: request.budget * 0.8,
-        estimatedTicks: 720,
+        estimatedTicks: 30,
         risks: ['市场接受度不确定', '技术挑战'],
         potentialEffects: ['解锁新的生产方式'],
         sideEffects: ['长期影响未知'],
@@ -673,8 +790,16 @@ ${context.proposedTerms.duration ? `- 合同期限: ${context.proposedTerms.dura
   /**
    * Generate strategic plan for AI company (大决策)
    * 这个方法只在每100 tick调用一次，用于制定战略方向
+   *
+   * 性能优化：如果LLM未启用，直接返回基于性格的默认战略，避免无效API调用
    */
   async generateStrategicPlan(request: StrategicAnalysisRequest): Promise<StrategicPlan> {
+    // 性能优化：检查是否应该尝试API调用
+    if (!this.shouldAttemptApiCall()) {
+      // 不打印日志，避免日志洪泛
+      return this.getDefaultStrategicPlan(request);
+    }
+    
     // 极简prompt，确保LLM能完整返回JSON
     const industries = request.ownedIndustries.slice(0, 2).join(',') || 'none';
     const playerInd = request.playerIndustries.slice(0, 2).join(',') || 'none';
@@ -730,8 +855,14 @@ Choose investmentFocus from: expand_capacity, reduce_cost, diversify`;
         reasoning: plan.reasoning.substring(0, 50),
       });
       
+      // 记录成功
+      this.recordSuccess();
+      
       return plan;
     } catch (error) {
+      // 记录失败（可能触发自动禁用）
+      this.recordFailure(error instanceof Error ? error : new Error(String(error)));
+      
       console.error('[LLM] Strategic plan generation error:', error);
       console.log(`[LLM] Falling back to personality-based plan for ${request.companyName}`);
       // 返回基于性格的默认战略

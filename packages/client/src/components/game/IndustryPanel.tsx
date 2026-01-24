@@ -97,6 +97,15 @@ const SHUTDOWN_STATUS_CONFIG = {
     borderClass: 'border-yellow-600/50',
     description: '电力供应不足，无法开工',
   },
+  waiting_materials: {
+    label: '等待材料',
+    icon: '📦',
+    color: 'cyan',
+    bgClass: 'bg-cyan-600/30',
+    textClass: 'text-cyan-400',
+    borderClass: 'border-cyan-600/50',
+    description: '建筑已购买，正在等待建造材料囤积完成',
+  },
   under_construction: {
     label: '建设中',
     icon: '🏗️',
@@ -158,7 +167,9 @@ const ShutdownAlertPanel = memo(function ShutdownAlertPanel() {
     }
     
     for (const building of buildings.values()) {
-      const status = String(building.operationalStatus);
+      // 优先使用服务端原始状态，fallback 到 operationalStatus
+      const serverStatus = (building as { serverStatus?: string }).serverStatus;
+      const status = serverStatus || String(building.operationalStatus);
       const statusInfo = getShutdownInfo(status);
       
       if (statusInfo) {
@@ -193,8 +204,8 @@ const ShutdownAlertPanel = memo(function ShutdownAlertPanel() {
     return null;
   }
   
-  // 按严重程度排序：缺原料 > 缺电力 > 缺工人 > 暂停 > 其他
-  const priorityOrder = ['lacking_inputs', 'lacking_energy', 'lacking_workers', 'paused', 'under_construction', 'upgrading'];
+  // 按严重程度排序：缺原料 > 缺电力 > 缺工人 > 等待材料 > 暂停 > 其他
+  const priorityOrder = ['lacking_inputs', 'lacking_energy', 'lacking_workers', 'waiting_materials', 'paused', 'under_construction', 'upgrading'];
   const sortedBuildings = [...shutdownBuildings].sort((a, b) => {
     const aKey = a.status.toLowerCase().replace(/-/g, '_');
     const bKey = b.status.toLowerCase().replace(/-/g, '_');
@@ -328,9 +339,13 @@ const CapacitySummaryCard = memo(function CapacitySummaryCard({
       result[category].count++;
       
       const avgNet = profitMap.get(building.id) ?? 0;
-      const status = String(building.operationalStatus);
+      // 优先使用服务端原始状态
+      const serverStatus = (building as { serverStatus?: string }).serverStatus;
+      const status = serverStatus || String(building.operationalStatus);
       
-      if (status === 'paused' || status === 'lacking_inputs') {
+      // 判断停工状态：paused, lacking_inputs/no_input, waiting_materials, under_construction
+      if (status === 'paused' || status === 'lacking_inputs' || status === 'no_input' ||
+          status === 'waiting_materials' || status === 'under_construction') {
         result[category].warning++;
       } else if (avgNet < 0) {
         result[category].loss++;
@@ -422,7 +437,98 @@ interface BuildingGroup {
   totalAvgNet: number;
   runningCount: number;
   warningCount: number;
+  /** 建造中的建筑（包括等待材料和正在建设） */
+  constructingBuildings: BuildingInstance[];
 }
+
+/** 扩展 BuildingInstance 类型以包含建造进度字段 */
+interface BuildingWithConstruction extends BuildingInstance {
+  serverStatus?: string;
+  constructionProgress?: number;
+  constructionTimeRequired?: number;
+}
+
+/** 建造进度条组件 */
+const ConstructionProgressBar = memo(function ConstructionProgressBar({
+  building,
+  buildingName,
+}: {
+  building: BuildingWithConstruction;
+  buildingName: string;
+}) {
+  const serverStatus = building.serverStatus || String(building.operationalStatus);
+  const isWaitingMaterials = serverStatus === 'waiting_materials';
+  const isUnderConstruction = serverStatus === 'under_construction';
+  
+  if (!isWaitingMaterials && !isUnderConstruction) {
+    return null;
+  }
+  
+  const progress = building.constructionProgress ?? 0;
+  const totalTime = building.constructionTimeRequired ?? 7;
+  // 修正：constructionProgress 是累计的 tick 数，不是百分比
+  // 剩余天数 = 总时间 - 已完成进度
+  const remainingDays = Math.max(0, Math.ceil(totalTime - progress));
+  // 进度百分比 = 已完成进度 / 总时间 * 100
+  const progressPercent = Math.min(100, Math.round((progress / totalTime) * 100));
+  
+  return (
+    <div className={`rounded-lg p-3 border ${
+      isWaitingMaterials
+        ? 'bg-orange-900/20 border-orange-500/50'
+        : 'bg-blue-900/20 border-blue-500/50'
+    }`}>
+      <div className="flex items-center justify-between mb-2">
+        <div className="flex items-center gap-2">
+          <span className="text-lg">{isWaitingMaterials ? '📦' : '🏗️'}</span>
+          <span className="text-sm font-medium text-white">{buildingName}</span>
+          <span className={`text-xs px-2 py-0.5 rounded-full ${
+            isWaitingMaterials
+              ? 'bg-orange-600/30 text-orange-400'
+              : 'bg-blue-600/30 text-blue-400'
+          }`}>
+            {isWaitingMaterials ? '等待材料' : '建设中'}
+          </span>
+        </div>
+        <div className="flex items-center gap-2 text-sm">
+          <span className={isWaitingMaterials ? 'text-orange-400' : 'text-blue-400'}>
+            {progressPercent}%
+          </span>
+          <span className="text-gray-400">|</span>
+          <span className="text-gray-300">
+            剩余 <span className="font-mono font-bold">{remainingDays}</span> 天
+          </span>
+        </div>
+      </div>
+      
+      {/* 进度条 */}
+      <div className="relative h-2 bg-slate-700 rounded-full overflow-hidden">
+        <div
+          className={`absolute left-0 top-0 h-full rounded-full transition-all duration-500 ${
+            isWaitingMaterials
+              ? 'bg-gradient-to-r from-orange-500 to-yellow-500'
+              : 'bg-gradient-to-r from-blue-500 to-cyan-500'
+          }`}
+          style={{ width: `${progressPercent}%` }}
+        />
+        {/* 动画效果 - 脉动光条 */}
+        {isUnderConstruction && progressPercent < 100 && (
+          <div
+            className="absolute top-0 h-full w-8 bg-gradient-to-r from-transparent via-white/30 to-transparent animate-pulse"
+            style={{ left: `${Math.max(0, progressPercent - 5)}%` }}
+          />
+        )}
+      </div>
+      
+      {/* 等待材料时显示提示 */}
+      {isWaitingMaterials && (
+        <div className="text-xs text-orange-300/70 mt-2">
+          💡 建筑已购买，正在等待建造材料囤积完成后开始建设
+        </div>
+      )}
+    </div>
+  );
+});
 
 // 原材料/产品流程图组件 - 显示名称版
 const RecipeFlowDiagram = memo(function RecipeFlowDiagram({
@@ -476,25 +582,41 @@ const RecipeFlowDiagram = memo(function RecipeFlowDiagram({
             inputs.map((input) => {
               const totalAmount = input.amount * count;
               const stockAmount = getStockAmount(input.goodsId);
+              // 缺货判断：库存不足以支撑一轮生产
               const isShortage = stockAmount < totalAmount;
+              // 严重缺货：库存为0或接近0
+              const isCriticalShortage = stockAmount < 1;
               const price = marketPrices[input.goodsId] ?? GOODS_MAP.get(input.goodsId)?.basePrice ?? 0;
+              
+              // 根据缺货程度决定样式
+              let bgClass = 'bg-red-900/30 border-red-700/30';
+              let stockClass = 'text-gray-500';
+              
+              if (isCriticalShortage) {
+                bgClass = 'bg-red-800/70 border-red-400/70 shadow-[0_0_10px_rgba(239,68,68,0.3)]';
+                stockClass = 'text-red-400 font-bold animate-pulse';
+              } else if (isShortage) {
+                bgClass = 'bg-red-900/50 border-red-500/50';
+                stockClass = 'text-yellow-400';
+              }
+              
               return (
                 <div
                   key={input.goodsId}
-                  className={`flex items-center gap-1.5 rounded-lg px-2 py-1 border cursor-pointer hover:opacity-80 transition-opacity ${
-                    isShortage
-                      ? 'bg-red-900/50 border-red-500/50'
-                      : 'bg-red-900/30 border-red-700/30'
-                  }`}
-                  title={`单价: ${formatMoney(price)} | 库存: ${stockAmount.toFixed(0)}`}
+                  className={`flex items-center gap-1.5 rounded-lg px-2 py-1 border cursor-pointer hover:opacity-80 transition-opacity ${bgClass}`}
+                  title={`单价: ${formatMoney(price)} | 库存: ${stockAmount.toFixed(0)}${isShortage ? ' ⚠️ 库存不足!' : ''}`}
                   onClick={() => onGoodsClick?.(input.goodsId)}
                 >
                   <span className="text-base">{getGoodsIcon(input.goodsId)}</span>
                   <span className="text-sm text-gray-300">{getGoodsName(input.goodsId)}</span>
                   <span className="text-red-400 font-mono text-sm">×{totalAmount}</span>
-                  <span className={`text-xs ${isShortage ? 'text-yellow-400' : 'text-gray-500'}`}>
+                  <span className={`text-xs ${stockClass}`}>
                     [{stockAmount.toFixed(0)}]
                   </span>
+                  {/* 缺货标识 */}
+                  {isCriticalShortage && (
+                    <span className="text-red-400 text-xs font-bold ml-1">⚠️缺货</span>
+                  )}
                 </div>
               );
             })
@@ -671,11 +793,16 @@ function BuildingGroupRow({
   onSelectBuilding: (buildingId: string) => void;
   onGoodsClick?: (goodsId: string) => void;
 }) {
-  const { def, buildings, totalAvgNet, runningCount, warningCount } = group;
+  const { def, buildings, totalAvgNet, runningCount, warningCount, constructingBuildings } = group;
   const count = buildings.length;
+  const constructingCount = constructingBuildings.length;
   
-  // 获取第一个建筑作为示例
-  const firstBuilding = buildings[0];
+  // 获取第一个运行中的建筑作为示例（优先显示运行中的）
+  const runningBuilding = buildings.find(b => {
+    const status = (b as BuildingWithConstruction).serverStatus || String(b.operationalStatus);
+    return status === 'running' || status === 'operational';
+  });
+  const firstBuilding = runningBuilding || buildings[0];
   if (!firstBuilding) return null;
   
   // 获取当前活跃的生产方式
@@ -683,21 +810,27 @@ function BuildingGroupRow({
   const activeMethodId = firstBuilding.activeMethodIds?.['process'] || activeSlot?.defaultMethodId;
   const activeMethod = activeSlot?.methods.find(m => m.id === activeMethodId);
 
-  // 注：recipeAnalysis 通过 RecipeFlowDiagram 组件内部计算并显示
-  // 此处不再需要额外计算
+  // 判断是否有建造中的建筑
+  const hasConstructing = constructingCount > 0;
 
   return (
-    <div className="bg-slate-800/30 rounded-lg p-4 border border-slate-700 hover:border-slate-600 transition-colors">
+    <div className={`bg-slate-800/30 rounded-lg p-4 border transition-colors ${
+      hasConstructing
+        ? 'border-blue-500/50 shadow-[0_0_15px_rgba(59,130,246,0.15)]'
+        : 'border-slate-700 hover:border-slate-600'
+    }`}>
       <div className="flex items-start gap-4">
         {/* 建筑图标 */}
-        <div className="text-3xl w-12 h-12 flex items-center justify-center bg-slate-700 rounded-lg flex-shrink-0">
+        <div className={`text-3xl w-12 h-12 flex items-center justify-center rounded-lg flex-shrink-0 ${
+          hasConstructing ? 'bg-blue-900/50 animate-pulse' : 'bg-slate-700'
+        }`}>
           {def.icon}
         </div>
         
         {/* 建筑信息 */}
         <div className="flex-1 min-w-0">
           <div className="flex items-center justify-between mb-2">
-            <div className="flex items-center gap-2">
+            <div className="flex items-center gap-2 flex-wrap">
               <h4 className="font-bold text-white truncate">{def.nameZh}</h4>
               <span className="text-sm text-cyan-400 bg-cyan-600/20 px-2 py-0.5 rounded-full">
                 ×{count}
@@ -707,9 +840,14 @@ function BuildingGroupRow({
                   🟢 {runningCount}运行中
                 </span>
               )}
-              {warningCount > 0 && (
+              {constructingCount > 0 && (
+                <span className="text-xs text-blue-400 bg-blue-900/30 px-2 py-0.5 rounded-full animate-pulse">
+                  🏗️ {constructingCount}建造中
+                </span>
+              )}
+              {warningCount > 0 && warningCount > constructingCount && (
                 <span className="text-xs text-red-400 bg-red-900/30 px-2 py-0.5 rounded-full animate-pulse">
-                  🚨 {warningCount}停工
+                  🚨 {warningCount - constructingCount}停工
                 </span>
               )}
             </div>
@@ -720,12 +858,25 @@ function BuildingGroupRow({
             </div>
           </div>
           
-          {/* 原材料和产品流程示意图 */}
-          {activeMethod && (
+          {/* 建造进度条列表 - 显示所有正在建造的建筑 */}
+          {constructingBuildings.length > 0 && (
+            <div className="space-y-2 mb-3">
+              {constructingBuildings.map((building, index) => (
+                <ConstructionProgressBar
+                  key={building.id}
+                  building={building as BuildingWithConstruction}
+                  buildingName={`${def.nameZh} #${index + 1}`}
+                />
+              ))}
+            </div>
+          )}
+          
+          {/* 原材料和产品流程示意图 - 只有有运行中的建筑时才显示 */}
+          {activeMethod && runningCount > 0 && (
             <RecipeFlowDiagram
               inputs={activeMethod.recipe.inputs}
               outputs={activeMethod.recipe.outputs}
-              count={count}
+              count={runningCount}
               ticksRequired={activeMethod.recipe.ticksRequired}
               marketPrices={marketPrices}
               inventory={inventory}
@@ -733,8 +884,8 @@ function BuildingGroupRow({
             />
           )}
           
-          {/* 生产方式选择器（Victoria 3 风格） */}
-          {activeSlot && (
+          {/* 生产方式选择器（Victoria 3 风格）- 只有有运行中的建筑时才显示 */}
+          {activeSlot && runningCount > 0 && (
             <MemoizedProductionMethodSelector
               slot={activeSlot}
               activeMethodId={activeMethodId || activeSlot.defaultMethodId}
@@ -860,11 +1011,23 @@ export const IndustryPanel = memo(function IndustryPanel() {
       // 计算汇总数据
       const totalAvgNet = data.profits.reduce((sum, p) => sum + (p.avgNet ?? p.net), 0);
       const runningCount = data.buildings.filter(b => {
-        const status = String(b.operationalStatus);
+        // 优先使用服务端原始状态
+        const serverStatus = (b as { serverStatus?: string }).serverStatus;
+        const status = serverStatus || String(b.operationalStatus);
         return status === 'running' || status === 'operational';
       }).length;
+      
+      // 收集建造中的建筑（等待材料或正在建设）
+      const constructingBuildings = data.buildings.filter(b => {
+        const serverStatus = (b as { serverStatus?: string }).serverStatus;
+        const status = serverStatus || String(b.operationalStatus);
+        return status === 'waiting_materials' || status === 'under_construction';
+      });
+      
       const warningCount = data.buildings.filter(b => {
-        const status = String(b.operationalStatus);
+        // 优先使用服务端原始状态
+        const serverStatus = (b as { serverStatus?: string }).serverStatus;
+        const status = serverStatus || String(b.operationalStatus);
         return status !== 'running' && status !== 'operational';
       }).length;
       
@@ -876,6 +1039,7 @@ export const IndustryPanel = memo(function IndustryPanel() {
         totalAvgNet,
         runningCount,
         warningCount,
+        constructingBuildings,
       });
     }
     

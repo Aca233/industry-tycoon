@@ -271,7 +271,7 @@ export const AI_COMPANIES_CONFIG: AICompanyConfig[] = [
     nameEn: 'Global Trading',
     personality: AIPersonality.CostLeader,
     initialCash: 280_000_000, // 2.8亿
-    initialBuildings: ['supermarket', 'convenience-store', 'electronics-mall'],
+    initialBuildings: ['supermarket', 'convenience-store', 'electronics-mall', 'appliance-mall'],
     color: '#a855f7', // 亮紫色
     icon: '🛒',
     llmPrompt: `你是"环球贸易"的CEO，一个专注于零售和贸易服务的企业家。
@@ -671,7 +671,7 @@ export const AI_COMPANIES_CONFIG: AICompanyConfig[] = [
     nameEn: 'Hengtong Retail',
     personality: AIPersonality.CostLeader,
     initialCash: 250_000_000, // 2.5亿
-    initialBuildings: ['supermarket', 'supermarket', 'restaurant'],
+    initialBuildings: ['supermarket', 'supermarket', 'restaurant', 'gas-station'],
     color: '#94a3b8', // 仓储灰
     icon: '🏪',
     llmPrompt: `你是"恒通商贸"的CEO，专业提供零售和餐饮服务。
@@ -681,6 +681,44 @@ export const AI_COMPANIES_CONFIG: AICompanyConfig[] = [
     riskTolerance: 0.3,
     aggressiveness: 0.3,
     rdPreference: 0.25,
+  },
+
+  // ========== 新增AI公司：汽车经销 ==========
+  {
+    id: 'ai-zhongtai-auto',
+    name: '中泰汽车销售',
+    nameEn: 'Zhongtai Auto Sales',
+    personality: AIPersonality.TrendSurfer,
+    initialCash: 320_000_000, // 3.2亿
+    initialBuildings: ['car-dealership', 'car-dealership', 'gas-station'],
+    color: '#3b82f6', // 蓝色
+    icon: '🚗',
+    llmPrompt: `你是"中泰汽车销售"的CEO，专业从事汽车零售。
+你同时销售电动车和燃油车，紧跟市场需求变化。
+你与多家汽车制造商有合作关系，力求提供最全的车型选择。`,
+    decisionInterval: 20,
+    riskTolerance: 0.5,
+    aggressiveness: 0.45,
+    rdPreference: 0.3,
+  },
+
+  // ========== 新增AI公司：建材贸易 ==========
+  {
+    id: 'ai-hongda-construction',
+    name: '宏达建材',
+    nameEn: 'Hongda Construction Materials',
+    personality: AIPersonality.OldMoney,
+    initialCash: 280_000_000, // 2.8亿
+    initialBuildings: ['construction-supplier', 'construction-supplier'],
+    color: '#78716c', // 建材灰
+    icon: '🏗️',
+    llmPrompt: `你是"宏达建材"的CEO，专业从事建筑材料供应。
+你与水泥厂、钢铁厂、玻璃厂有长期合作，为建筑行业提供一站式建材服务。
+你注重供应链稳定和长期客户关系。`,
+    decisionInterval: 24,
+    riskTolerance: 0.3,
+    aggressiveness: 0.3,
+    rdPreference: 0.2,
   },
 ];
 

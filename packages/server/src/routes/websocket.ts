@@ -37,6 +37,8 @@ export async function websocketRoutes(app: FastifyInstance) {
     // Initialize or get game
     const game = gameLoop.getOrCreateGame(gameId);
     
+    console.log(`[WS] Game state: tick=${game.currentTick}, speed=${game.speed}, isPaused=${game.isPaused}, buildings=${game.buildings.length}`);
+    
     // Send initial state with playerCash for immediate UI sync
     socket.send(JSON.stringify({
       type: 'init',
@@ -63,13 +65,16 @@ export async function websocketRoutes(app: FastifyInstance) {
         switch (message.type) {
           case 'setSpeed': {
             const speed = (message.payload?.speed as number) ?? 1;
+            console.log(`[WS] setSpeed called: speed=${speed}`);
             gameLoop.setSpeed(gameId, speed as 0 | 1 | 2 | 4);
             break;
           }
           
           case 'togglePause': {
+            console.log(`[WS] togglePause called`);
             const isPaused = gameLoop.togglePause(gameId);
             const gameState = gameLoop.getGame(gameId);
+            console.log(`[WS] After togglePause: isPaused=${isPaused}, speed=${gameState?.speed}`);
             broadcast(gameId, {
               type: 'pauseChange',
               payload: {
